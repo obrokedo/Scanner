@@ -764,6 +764,103 @@ def parse_sbom(path: Path, distro_hint: str = "") -> list:
     return _parse_simple_json(data)
 
 
+# ─── Scan Loading & Diff ──────────────────────────────────────────────────────
+
+def _load_scan_json(path: Path) -> list:
+    """Deserialize a previous JSON report (produced by to_json_report) into PackageReport objects."""
+    data = json.loads(path.read_text(encoding="utf-8"))
+    packages_data = data.get("packages", data) if isinstance(data, dict) else data
+    if not isinstance(packages_data, list):
+        raise ValueError(f"Cannot load scan from {path}: expected JSON with 'packages' list")
+
+    reports = []
+    for entry in packages_data:
+        pkg = Package(
+            name=entry.get("name", ""),
+            version=entry.get("version", ""),
+            ecosystem=entry.get("ecosystem", ""),
+            purl=entry.get("purl"),
+        )
+        vulns = []
+        for v in entry.get("vulnerabilities", []):
+            cvss = None
+            if v.get("cvss_v3"):
+                c = v["cvss_v3"]
+                cvss = CvssV3(
+                    vector_string=c.get("vector_string", ""),
+                    base_score=c.get("base_score", 0.0),
+                    severity=c.get("severity", ""),
+                    attack_vector=c.get("attack_vector", ""),
+                    attack_complexity=c.get("attack_complexity", ""),
+                    privileges_required=c.get("privileges_required", ""),
+                    user_interaction=c.get("user_interaction", ""),
+                    scope=c.get("scope", ""),
+                    confidentiality_impact=c.get("confidentiality_impact", ""),
+                    integrity_impact=c.get("integrity_impact", ""),
+                    availability_impact=c.get("availability_impact", ""),
+                )
+            vulns.append(Vulnerability(
+                id=v.get("id", ""),
+                aliases=v.get("aliases", []),
+                cve_ids=v.get("cve_ids", []),
+                summary=v.get("summary", ""),
+                details=v.get("details", ""),
+                cvss_v3=cvss,
+                severity_label=v.get("severity", "Unknown"),
+                affected_ranges=v.get("affected_ranges", []),
+                fixed_version=v.get("fixed_version"),
+                published=v.get("published", ""),
+                modified=v.get("modified", ""),
+                references=v.get("references", []),
+            ))
+        reports.append(PackageReport(package=pkg, vulnerabilities=vulns, error=entry.get("error")))
+    return reports
+
+
+def compute_diff(baseline: list, current: list) -> dict:
+    """Compare two lists of PackageReport and return a diff dict.
+
+    Keys:
+      remediated       - (report, vuln) pairs present in baseline but absent from current
+      introduced       - (report, vuln) pairs absent from baseline but present in current
+      persistent       - (report, vuln) pairs present in both (current-side data used)
+      packages_added   - Package objects in current but not in baseline
+      packages_removed - Package objects in baseline but not in current
+      packages_upgraded - list of (baseline_pkg, current_pkg) where version differs
+    """
+    def _vkey(pkg: Package, vuln: Vulnerability) -> tuple:
+        return (pkg.ecosystem.lower(), pkg.name.lower(), vuln.primary_id().lower())
+
+    def _pkey(pkg: Package) -> tuple:
+        return (pkg.ecosystem.lower(), pkg.name.lower())
+
+    base_vulns: dict = {}
+    for r in baseline:
+        for v in r.vulnerabilities:
+            base_vulns[_vkey(r.package, v)] = (r, v)
+
+    cur_vulns: dict = {}
+    for r in current:
+        for v in r.vulnerabilities:
+            cur_vulns[_vkey(r.package, v)] = (r, v)
+
+    base_pkgs: dict = {_pkey(r.package): r.package for r in baseline}
+    cur_pkgs:  dict = {_pkey(r.package): r.package for r in current}
+
+    return {
+        "remediated":        [(r, v) for k, (r, v) in base_vulns.items() if k not in cur_vulns],
+        "introduced":        [(r, v) for k, (r, v) in cur_vulns.items()  if k not in base_vulns],
+        "persistent":        [cur_vulns[k] for k in base_vulns if k in cur_vulns],
+        "packages_added":    [p for k, p in cur_pkgs.items()  if k not in base_pkgs],
+        "packages_removed":  [p for k, p in base_pkgs.items() if k not in cur_pkgs],
+        "packages_upgraded": [
+            (base_pkgs[k], cur_pkgs[k])
+            for k in base_pkgs
+            if k in cur_pkgs and base_pkgs[k].version != cur_pkgs[k].version
+        ],
+    }
+
+
 # ─── OSV API ─────────────────────────────────────────────────────────────────
 
 _OSV_BATCH_URL  = "https://api.osv.dev/v1/querybatch"
@@ -1229,6 +1326,86 @@ def print_console_report(reports: list, use_color: bool = True):
     print()
 
 
+def print_console_diff(diff: dict, baseline_src: str, current_src: str, use_color: bool = True):
+    sep    = "-" * 72
+    n_rem  = len(diff["remediated"])
+    n_new  = len(diff["introduced"])
+    n_pers = len(diff["persistent"])
+    n_add  = len(diff["packages_added"])
+    n_del  = len(diff["packages_removed"])
+    n_upg  = len(diff["packages_upgraded"])
+
+    print()
+    print("=" * 72)
+    print(f"  SBOM CVE DIFF REPORT  --  {datetime.now().strftime('%Y-%m-%d %H:%M')}")
+    print("=" * 72)
+    print(f"  Baseline : {baseline_src}")
+    print(f"  Current  : {current_src}")
+    print()
+    rem_line  = f"  Remediated (fixed)        : {n_rem}"
+    new_line  = f"  Introduced (new)          : {n_new}"
+    print(_sev_color("Low",      rem_line, use_color) if n_rem else rem_line)
+    print(_sev_color("Critical", new_line, use_color) if n_new else new_line)
+    print(f"  Persistent (unchanged)    : {n_pers}")
+    print()
+    print(f"  Packages added            : {n_add}")
+    print(f"  Packages removed          : {n_del}")
+    print(f"  Packages upgraded         : {n_upg}")
+    print("=" * 72)
+
+    def _row(report, vuln):
+        sev   = vuln.severity_label
+        score = f" ({vuln.cvss_v3.base_score})" if vuln.cvss_v3 and vuln.cvss_v3.base_score else ""
+        fix   = (f"  => upgrade to >= {vuln.fixed_version}"
+                 if vuln.fixed_version else "  => no fix available")
+        badge = _sev_color(sev, f"[{sev[:4].upper()}]", use_color)
+        print(f"  {badge}{score}  {report.package.display()}")
+        print(f"           {vuln.primary_id()}{fix}")
+
+    def _sorted_pairs(pairs):
+        return sorted(pairs,
+                      key=lambda rv: rv[1].cvss_v3.base_score if rv[1].cvss_v3 else 0,
+                      reverse=True)
+
+    if diff["remediated"]:
+        print()
+        print(f"--- REMEDIATED ({n_rem}) ---")
+        print("  These vulnerabilities were in the baseline and are no longer detected.")
+        print()
+        for r, v in _sorted_pairs(diff["remediated"]):
+            _row(r, v)
+
+    if diff["introduced"]:
+        print()
+        print(f"--- INTRODUCED ({n_new}) ---")
+        print("  These vulnerabilities are newly detected and were not in the baseline.")
+        print()
+        for r, v in _sorted_pairs(diff["introduced"]):
+            _row(r, v)
+
+    if diff["persistent"]:
+        print()
+        print(f"--- PERSISTENT ({n_pers}) ---")
+        print("  These vulnerabilities remain unaddressed in both scans.")
+        print()
+        for r, v in _sorted_pairs(diff["persistent"]):
+            _row(r, v)
+
+    if n_add or n_del or n_upg:
+        print()
+        print("--- PACKAGE CHANGES ---")
+        for pkg in sorted(diff["packages_added"], key=lambda p: p.name.lower()):
+            print(f"  ADDED   : {pkg.display()}")
+        for pkg in sorted(diff["packages_removed"], key=lambda p: p.name.lower()):
+            print(f"  REMOVED : {pkg.display()}")
+        for bp, cp in sorted(diff["packages_upgraded"], key=lambda t: t[0].name.lower()):
+            print(f"  UPGRADED: {bp.ecosystem}/{bp.name}  {bp.version} => {cp.version}")
+
+    print()
+    print(sep)
+    print()
+
+
 # ─── JSON Report ──────────────────────────────────────────────────────────────
 
 def to_json_report(reports: list) -> str:
@@ -1293,6 +1470,60 @@ def to_json_report(reports: list) -> str:
     return json.dumps(out, indent=2)
 
 
+def to_json_diff(diff: dict, baseline_src: str, current_src: str) -> str:
+    def _vuln_entry(report, vuln) -> dict:
+        c = vuln.cvss_v3
+        return {
+            "package": {
+                "name":      report.package.name,
+                "version":   report.package.version,
+                "ecosystem": report.package.ecosystem,
+            },
+            "id":          vuln.id,
+            "primary_id":  vuln.primary_id(),
+            "cve_ids":     vuln.cve_ids,
+            "severity":    vuln.severity_label,
+            "cvss_score":  c.base_score if c else None,
+            "summary":     vuln.summary,
+            "fixed_version": vuln.fixed_version,
+            "remediation": (f"Upgrade to >= {vuln.fixed_version}"
+                            if vuln.fixed_version else "No fix available"),
+        }
+
+    def _pkg_entry(pkg) -> dict:
+        return {"name": pkg.name, "version": pkg.version, "ecosystem": pkg.ecosystem}
+
+    out = {
+        "generated_at": datetime.now().isoformat(),
+        "tool": "sbom-cve-checker",
+        "diff": {
+            "baseline_source": baseline_src,
+            "current_source":  current_src,
+            "summary": {
+                "remediated":        len(diff["remediated"]),
+                "introduced":        len(diff["introduced"]),
+                "persistent":        len(diff["persistent"]),
+                "packages_added":    len(diff["packages_added"]),
+                "packages_removed":  len(diff["packages_removed"]),
+                "packages_upgraded": len(diff["packages_upgraded"]),
+            },
+            "remediated": [_vuln_entry(r, v) for r, v in diff["remediated"]],
+            "introduced": [_vuln_entry(r, v) for r, v in diff["introduced"]],
+            "persistent": [_vuln_entry(r, v) for r, v in diff["persistent"]],
+            "packages_added":    [_pkg_entry(p) for p in diff["packages_added"]],
+            "packages_removed":  [_pkg_entry(p) for p in diff["packages_removed"]],
+            "packages_upgraded": [
+                {
+                    "name": bp.name, "ecosystem": bp.ecosystem,
+                    "baseline_version": bp.version, "current_version": cp.version,
+                }
+                for bp, cp in diff["packages_upgraded"]
+            ],
+        },
+    }
+    return json.dumps(out, indent=2)
+
+
 # ─── CSV Report ───────────────────────────────────────────────────────────────
 
 def to_csv_report(reports: list) -> str:
@@ -1335,6 +1566,40 @@ def to_csv_report(reports: list) -> str:
                 "modified":        vuln.modified[:10] if vuln.modified else "",
                 "references":      "; ".join(r.get("url", "") for r in vuln.references[:5]),
             })
+    return out.getvalue()
+
+
+def to_csv_diff(diff: dict) -> str:
+    out = io.StringIO()
+    fields = [
+        "change_type", "package_name", "package_version", "ecosystem",
+        "vuln_id", "cve_ids", "severity", "cvss_score",
+        "summary", "fixed_version", "remediation",
+    ]
+    w = csv.DictWriter(out, fieldnames=fields, extrasaction="ignore")
+    w.writeheader()
+
+    def _write(pairs, change_type):
+        for report, vuln in pairs:
+            c = vuln.cvss_v3
+            w.writerow({
+                "change_type":     change_type,
+                "package_name":    report.package.name,
+                "package_version": report.package.version,
+                "ecosystem":       report.package.ecosystem,
+                "vuln_id":         vuln.id,
+                "cve_ids":         "; ".join(vuln.cve_ids),
+                "severity":        vuln.severity_label,
+                "cvss_score":      c.base_score if c else "",
+                "summary":         vuln.summary,
+                "fixed_version":   vuln.fixed_version or "",
+                "remediation":     (f"Upgrade to >= {vuln.fixed_version}"
+                                    if vuln.fixed_version else "No fix available"),
+            })
+
+    _write(diff["remediated"], "REMEDIATED")
+    _write(diff["introduced"], "INTRODUCED")
+    _write(diff["persistent"], "PERSISTENT")
     return out.getvalue()
 
 
@@ -1464,6 +1729,129 @@ def to_html_report(reports: list) -> str:
 </html>"""
 
 
+def to_html_diff(diff: dict, baseline_src: str, current_src: str) -> str:
+    n_rem  = len(diff["remediated"])
+    n_new  = len(diff["introduced"])
+    n_pers = len(diff["persistent"])
+
+    def badge(sev: str) -> str:
+        color = _SEV_BADGE.get(sev, "#6c757d")
+        return (f'<span style="background:{color};color:white;padding:2px 8px;'
+                f'border-radius:4px;font-size:.85em;font-weight:bold">{sev.upper()}</span>')
+
+    def _vuln_rows(pairs, row_bg):
+        rows = []
+        for report, vuln in sorted(pairs,
+                                   key=lambda rv: rv[1].cvss_v3.base_score if rv[1].cvss_v3 else 0,
+                                   reverse=True):
+            c = vuln.cvss_v3
+            score = f"<b>{c.base_score}</b>" if c and c.base_score else "N/A"
+            fix   = (f'<code style="color:#155724">&ge; {vuln.fixed_version}</code>'
+                     if vuln.fixed_version else '<em style="color:#721c24">No fix available</em>')
+            rows.append(f"""
+              <tr style="background:{row_bg}">
+                <td>{report.package.name}<br>
+                  <small style="color:#666">{report.package.version} &middot; {report.package.ecosystem}</small></td>
+                <td><code>{vuln.primary_id()}</code></td>
+                <td style="text-align:center">{badge(vuln.severity_label)}<br>{score}</td>
+                <td>{vuln.summary or "&mdash;"}</td>
+                <td>{fix}</td>
+              </tr>""")
+        return "".join(rows)
+
+    def _section(title, pairs, bg, empty_msg):
+        if not pairs:
+            return (f'<h2 style="margin-top:32px">{title} (0)</h2>'
+                    f'<p style="color:#6c757d">{empty_msg}</p>')
+        rows = _vuln_rows(pairs, bg)
+        return f"""
+        <h2 style="margin-top:32px">{title} ({len(pairs)})</h2>
+        <table>
+          <thead>
+            <tr><th style="width:18%">Package</th><th style="width:13%">CVE / ID</th>
+                <th style="width:10%">Severity</th><th>Summary</th>
+                <th style="width:15%">Remediation</th></tr>
+          </thead>
+          <tbody>{rows}</tbody>
+        </table>"""
+
+    pkg_rows = []
+    for pkg in sorted(diff["packages_added"], key=lambda p: p.name.lower()):
+        pkg_rows.append(
+            f'<tr style="background:#d4edda"><td><b>ADDED</b></td>'
+            f'<td>{pkg.name}</td><td>{pkg.version}</td><td>{pkg.ecosystem}</td></tr>')
+    for pkg in sorted(diff["packages_removed"], key=lambda p: p.name.lower()):
+        pkg_rows.append(
+            f'<tr style="background:#f8d7da"><td><b>REMOVED</b></td>'
+            f'<td>{pkg.name}</td><td>{pkg.version}</td><td>{pkg.ecosystem}</td></tr>')
+    for bp, cp in sorted(diff["packages_upgraded"], key=lambda t: t[0].name.lower()):
+        pkg_rows.append(
+            f'<tr style="background:#fff3cd"><td><b>UPGRADED</b></td><td>{bp.name}</td>'
+            f'<td><del style="color:#721c24">{bp.version}</del>'
+            f' &rarr; <b style="color:#155724">{cp.version}</b></td>'
+            f'<td>{bp.ecosystem}</td></tr>')
+
+    pkg_table = ""
+    if pkg_rows:
+        pkg_table = f"""
+        <h2 style="margin-top:32px">Package Changes</h2>
+        <table>
+          <thead><tr><th>Change</th><th>Package</th><th>Version</th><th>Ecosystem</th></tr></thead>
+          <tbody>{''.join(pkg_rows)}</tbody>
+        </table>"""
+
+    return f"""<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>SBOM CVE Diff -- {datetime.now().strftime('%Y-%m-%d')}</title>
+<style>
+  body{{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Arial,sans-serif;margin:0;padding:20px;background:#f5f6fa}}
+  .card{{max-width:1300px;margin:0 auto;background:#fff;padding:28px;border-radius:8px;box-shadow:0 1px 4px rgba(0,0,0,.12)}}
+  h1{{margin:0 0 4px;color:#212529}}
+  h2{{color:#212529;border-bottom:1px solid #dee2e6;padding-bottom:6px}}
+  .meta{{color:#6c757d;font-size:.9em;margin-bottom:20px}}
+  .summary{{display:flex;gap:12px;flex-wrap:wrap;margin-bottom:24px}}
+  .stat{{border:1px solid #dee2e6;border-radius:6px;padding:12px 20px;text-align:center;min-width:90px}}
+  .stat .n{{font-size:2em;font-weight:700;line-height:1}}
+  .stat .l{{color:#6c757d;font-size:.8em;margin-top:4px}}
+  .rem .n{{color:#28a745}} .new .n{{color:#dc3545}} .pers .n{{color:#fd7e14}}
+  table{{width:100%;border-collapse:collapse;font-size:.9em;margin-bottom:12px}}
+  thead{{background:#343a40;color:#fff}}
+  thead th{{padding:10px 8px;text-align:left;font-weight:600}}
+  tbody td{{padding:8px;border:1px solid #dee2e6;vertical-align:top}}
+  tbody tr:hover{{filter:brightness(.97)}}
+  code{{background:#f1f3f5;padding:1px 4px;border-radius:3px;font-size:.85em}}
+</style>
+</head>
+<body>
+<div class="card">
+  <h1>SBOM CVE Diff Report</h1>
+  <p class="meta">
+    Generated: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}<br>
+    Baseline: <code>{baseline_src}</code> &rarr; Current: <code>{current_src}</code>
+  </p>
+  <div class="summary">
+    <div class="stat rem"><div class="n">{n_rem}</div><div class="l">Remediated</div></div>
+    <div class="stat new"><div class="n">{n_new}</div><div class="l">Introduced</div></div>
+    <div class="stat pers"><div class="n">{n_pers}</div><div class="l">Persistent</div></div>
+    <div class="stat"><div class="n">{len(diff['packages_added'])}</div><div class="l">Pkg Added</div></div>
+    <div class="stat"><div class="n">{len(diff['packages_removed'])}</div><div class="l">Pkg Removed</div></div>
+    <div class="stat"><div class="n">{len(diff['packages_upgraded'])}</div><div class="l">Pkg Upgraded</div></div>
+  </div>
+  {_section("Remediated Vulnerabilities", diff["remediated"], "#d4edda",
+            "No vulnerabilities were remediated.")}
+  {_section("Introduced Vulnerabilities",  diff["introduced"],  "#f8d7da",
+            "No new vulnerabilities were introduced.")}
+  {_section("Persistent Vulnerabilities",  diff["persistent"],  "#fff3cd",
+            "No persistent vulnerabilities.")}
+  {pkg_table}
+</div>
+</body>
+</html>"""
+
+
 # ─── Main ─────────────────────────────────────────────────────────────────────
 
 _SEVERITY_RANK = {"critical": 4, "high": 3, "medium": 2, "low": 1, "none": 0, "unknown": 0}
@@ -1484,7 +1872,14 @@ Examples:
         """
     )
     ap.add_argument("--sbom",        type=Path,
-                    help="SBOM file (CycloneDX JSON, SPDX JSON, simple JSON, or CSV)")
+                    help="SBOM file (CycloneDX JSON, SPDX JSON, simple JSON, or CSV). "
+                         "Not required when --baseline and --compare are both given.")
+    ap.add_argument("--baseline",    type=Path, metavar="PATH",
+                    help="Previous JSON scan report to use as the baseline for diff mode. "
+                         "When provided, output shows remediated/introduced/persistent CVEs.")
+    ap.add_argument("--compare",     type=Path, metavar="PATH",
+                    help="Use this JSON scan report as the 'current' state instead of running "
+                         "a live scan. Requires --baseline. Makes --sbom optional.")
     ap.add_argument("--format",      choices=["console", "json", "csv", "html"],
                     default="console", help="Output format (default: console)")
     ap.add_argument("--output",      type=Path,
@@ -1541,7 +1936,7 @@ Examples:
         if args.clear_cache:
             db.clear()
             print(f"[*] Cache cleared: {cache_path}", file=sys.stderr)
-            if not args.sbom:
+            if not args.sbom and not (args.baseline and args.compare):
                 db.close()
                 sys.exit(0)
 
@@ -1556,83 +1951,115 @@ Examples:
               "(remove --no-cache).", file=sys.stderr)
         sys.exit(1)
 
-    if not args.sbom:
-        ap.error("--sbom is required unless using --cache-info or --clear-cache alone")
+    # ── Validate flag combinations ──
+    if args.compare and not args.baseline:
+        ap.error("--compare requires --baseline")
 
-    # ── Parse SBOM ──
-    if not args.sbom.exists():
-        print(f"Error: file not found: {args.sbom}", file=sys.stderr)
-        sys.exit(1)
+    diff_mode = bool(args.baseline)
+    need_sbom = not (args.baseline and args.compare)
 
-    # Resolve distro hint: --distro wins; fall back to --base-image parsing
-    distro_hint = ""
-    if args.distro:
-        parts     = args.distro.split(":", 1)
-        name_part = parts[0].capitalize()
-        ver_part  = parts[1] if len(parts) > 1 else ""
-        if name_part.lower() == "alpine" and ver_part and not ver_part.startswith("v"):
-            ver_part = f"v{ver_part}"
-        distro_hint = f"{name_part}:{ver_part}" if ver_part else name_part
-    elif args.base_image:
-        distro_hint = distro_from_image_tag(args.base_image)
-        if distro_hint:
-            print(f"[*] Base image '{args.base_image}' -> OS ecosystem: {distro_hint}",
-                  file=sys.stderr)
-        else:
-            print(f"[*] WARNING: Could not infer OS ecosystem from image tag "
-                  f"'{args.base_image}'. OS packages may be skipped. "
-                  f"Use --distro to set it explicitly.", file=sys.stderr)
+    if need_sbom and not args.sbom:
+        ap.error("--sbom is required (or use --baseline + --compare to diff two saved reports)")
 
-    print(f"[*] Parsing SBOM: {args.sbom}", file=sys.stderr)
-    try:
-        packages = parse_sbom(args.sbom, distro_hint=distro_hint)
-    except Exception as exc:
-        print(f"Error parsing SBOM: {exc}", file=sys.stderr)
-        sys.exit(1)
+    # ── Resolve current scan (pre-saved report, or live scan) ──
+    if args.compare:
+        # Both sides are saved JSON reports — no live scan needed
+        print(f"[*] Loading baseline : {args.baseline}", file=sys.stderr)
+        print(f"[*] Loading current  : {args.compare}",  file=sys.stderr)
+        try:
+            baseline_reports = _load_scan_json(args.baseline)
+            current_reports  = _load_scan_json(args.compare)
+        except Exception as exc:
+            print(f"Error loading scan report: {exc}", file=sys.stderr)
+            sys.exit(1)
+        baseline_src = str(args.baseline)
+        current_src  = str(args.compare)
+    else:
+        # Live scan from --sbom
+        if not args.sbom.exists():
+            print(f"Error: file not found: {args.sbom}", file=sys.stderr)
+            sys.exit(1)
 
-    if not packages:
-        print("No packages found in SBOM.", file=sys.stderr)
-        sys.exit(1)
-    print(f"[*] Found {len(packages)} package(s).", file=sys.stderr)
-
-    # ── Query OSV ──
-    print("[*] Querying OSV.dev for vulnerabilities...", file=sys.stderr)
-    osv_results, osv_hits, osv_misses = _query_osv(packages, verbose=args.verbose, db=db)
-    if db is not None:
-        print(f"    OSV cache: {osv_hits} hit(s), {osv_misses} miss(es)", file=sys.stderr)
-
-    reports = []
-    for pkg, result in zip(packages, osv_results):
-        vulns = _parse_osv_result(result, pkg)
-        reports.append(PackageReport(package=pkg, vulnerabilities=vulns))
-
-    # ── NVD Enrichment ──
-    if not args.no_nvd:
-        cves = [cid for r in reports for v in r.vulnerabilities for cid in v.cve_ids]
-        unique_cves = len(set(cves))
-        if unique_cves:
-            if not args.nvd_api_key:
-                print(
-                    f"[*] Enriching {unique_cves} CVE(s) via NVD (no API key — ~6 s/request)...",
-                    file=sys.stderr,
-                )
-                if db is None:
-                    print("[*] Tip: enable the cache (drop --no-cache) to avoid re-fetching "
-                          "on subsequent runs.", file=sys.stderr)
+        # Resolve distro hint: --distro wins; fall back to --base-image parsing
+        distro_hint = ""
+        if args.distro:
+            parts     = args.distro.split(":", 1)
+            name_part = parts[0].capitalize()
+            ver_part  = parts[1] if len(parts) > 1 else ""
+            if name_part.lower() == "alpine" and ver_part and not ver_part.startswith("v"):
+                ver_part = f"v{ver_part}"
+            distro_hint = f"{name_part}:{ver_part}" if ver_part else name_part
+        elif args.base_image:
+            distro_hint = distro_from_image_tag(args.base_image)
+            if distro_hint:
+                print(f"[*] Base image '{args.base_image}' -> OS ecosystem: {distro_hint}",
+                      file=sys.stderr)
             else:
-                print(f"[*] Enriching {unique_cves} CVE(s) via NVD (with API key)...",
-                      file=sys.stderr)
-            nvd_hits, nvd_fetches = enrich_with_nvd(
-                reports, args.nvd_api_key, args.verbose, db=db
-            )
-            if db is not None:
-                print(f"    NVD cache: {nvd_hits} hit(s), {nvd_fetches} API call(s)",
-                      file=sys.stderr)
+                print(f"[*] WARNING: Could not infer OS ecosystem from image tag "
+                      f"'{args.base_image}'. OS packages may be skipped. "
+                      f"Use --distro to set it explicitly.", file=sys.stderr)
 
-    # ── Filter ──
+        print(f"[*] Parsing SBOM: {args.sbom}", file=sys.stderr)
+        try:
+            packages = parse_sbom(args.sbom, distro_hint=distro_hint)
+        except Exception as exc:
+            print(f"Error parsing SBOM: {exc}", file=sys.stderr)
+            sys.exit(1)
+
+        if not packages:
+            print("No packages found in SBOM.", file=sys.stderr)
+            sys.exit(1)
+        print(f"[*] Found {len(packages)} package(s).", file=sys.stderr)
+
+        # ── Query OSV ──
+        print("[*] Querying OSV.dev for vulnerabilities...", file=sys.stderr)
+        osv_results, osv_hits, osv_misses = _query_osv(packages, verbose=args.verbose, db=db)
+        if db is not None:
+            print(f"    OSV cache: {osv_hits} hit(s), {osv_misses} miss(es)", file=sys.stderr)
+
+        current_reports = []
+        for pkg, result in zip(packages, osv_results):
+            vulns = _parse_osv_result(result, pkg)
+            current_reports.append(PackageReport(package=pkg, vulnerabilities=vulns))
+
+        # ── NVD Enrichment ──
+        if not args.no_nvd:
+            cves = [cid for r in current_reports for v in r.vulnerabilities for cid in v.cve_ids]
+            unique_cves = len(set(cves))
+            if unique_cves:
+                if not args.nvd_api_key:
+                    print(
+                        f"[*] Enriching {unique_cves} CVE(s) via NVD (no API key -- ~6 s/request)...",
+                        file=sys.stderr,
+                    )
+                    if db is None:
+                        print("[*] Tip: enable the cache (drop --no-cache) to avoid re-fetching "
+                              "on subsequent runs.", file=sys.stderr)
+                else:
+                    print(f"[*] Enriching {unique_cves} CVE(s) via NVD (with API key)...",
+                          file=sys.stderr)
+                nvd_hits, nvd_fetches = enrich_with_nvd(
+                    current_reports, args.nvd_api_key, args.verbose, db=db
+                )
+                if db is not None:
+                    print(f"    NVD cache: {nvd_hits} hit(s), {nvd_fetches} API call(s)",
+                          file=sys.stderr)
+
+        current_src = str(args.sbom)
+
+        if diff_mode:
+            print(f"[*] Loading baseline: {args.baseline}", file=sys.stderr)
+            try:
+                baseline_reports = _load_scan_json(args.baseline)
+            except Exception as exc:
+                print(f"Error loading baseline report: {exc}", file=sys.stderr)
+                sys.exit(1)
+            baseline_src = str(args.baseline)
+
+    # ── Severity filter (applied to current scan) ──
     if args.min_severity:
         min_rank = _SEVERITY_RANK[args.min_severity]
-        for report in reports:
+        for report in current_reports:
             report.vulnerabilities = [
                 v for v in report.vulnerabilities
                 if _SEVERITY_RANK.get(v.severity_label.lower(), 0) >= min_rank
@@ -1640,6 +2067,40 @@ Examples:
 
     # ── Output ──
     use_color = not args.no_color and args.format == "console" and sys.stdout.isatty()
+
+    if diff_mode:
+        diff = compute_diff(baseline_reports, current_reports)
+
+        if args.format == "console":
+            print_console_diff(diff, baseline_src, current_src, use_color=use_color)
+        else:
+            if args.format == "json":
+                content = to_json_diff(diff, baseline_src, current_src)
+            elif args.format == "csv":
+                content = to_csv_diff(diff)
+            else:
+                content = to_html_diff(diff, baseline_src, current_src)
+
+            if args.output:
+                args.output.write_text(content, encoding="utf-8")
+                print(f"[*] Report written to {args.output}", file=sys.stderr)
+            else:
+                print(content)
+
+        if db is not None:
+            db.close()
+
+        # CI exit codes: fail only on newly introduced vulns (persistent are already known)
+        intro_crit = sum(1 for _, v in diff["introduced"] if v.severity_label == "Critical")
+        intro_high = sum(1 for _, v in diff["introduced"] if v.severity_label == "High")
+        if intro_crit:
+            sys.exit(2)
+        elif intro_high:
+            sys.exit(1)
+        return
+
+    # ── Regular (non-diff) output ──
+    reports = current_reports
 
     if args.format == "console":
         print_console_report(reports, use_color=use_color)

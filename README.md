@@ -218,9 +218,16 @@ OSV ecosystem strings for common package types:
 
 | Flag | Description |
 |---|---|
-| `--sbom PATH` | SBOM file to scan. Format is auto-detected. |
+| `--sbom PATH` | SBOM file to scan. Format is auto-detected. Optional when `--baseline` and `--compare` are both given. |
 | `--base-image IMAGE` | Base container image tag (e.g. `python:3.9-slim-bullseye`). Resolves the OS ecosystem for custom scanner format files. Supports Debian, Ubuntu, Alpine, RHEL/UBI, Rocky Linux, AlmaLinux, and distroless images. |
 | `--distro DISTRO` | Explicit OS ecosystem (e.g. `debian:11`). Overrides `--base-image`. |
+
+### Diff / comparison
+
+| Flag | Description |
+|---|---|
+| `--baseline PATH` | Previous JSON scan report to compare against. Enables diff mode: output shows which CVEs were remediated, introduced, or persistent. |
+| `--compare PATH` | Use a second saved JSON report as the "current" state instead of running a live scan. Requires `--baseline`. Makes `--sbom` optional. |
 
 ### Output
 
@@ -262,6 +269,14 @@ Designed for use in CI pipelines.
 | `1` | One or more High severity CVEs found |
 | `2` | One or more Critical severity CVEs found |
 
+In diff mode (`--baseline`), exit codes are based on **introduced** (newly added) vulnerabilities only — persistent CVEs that were already in the baseline are ignored for the CI gate.
+
+| Code | Meaning in diff mode |
+|---|---|
+| `0` | No new Critical or High CVEs introduced |
+| `1` | One or more newly **introduced** High CVEs |
+| `2` | One or more newly **introduced** Critical CVEs |
+
 ---
 
 ## Examples
@@ -292,6 +307,20 @@ python sbom_cve_checker.py --cache-info
 
 # Force a fresh scan (ignore cached results)
 python sbom_cve_checker.py --sbom sbom.json --no-cache
+
+# Save a scan as a JSON baseline for future comparison
+python sbom_cve_checker.py --sbom sbom_v1.json --format json --output scan_v1.json --no-nvd
+
+# Diff: compare a new live scan against that baseline
+python sbom_cve_checker.py --sbom sbom_v2.json --baseline scan_v1.json --no-nvd
+echo "Exit code: $?"   # 0=no new vulns, 1=new high, 2=new critical
+
+# Diff: compare two previously saved scans (no live API calls)
+python sbom_cve_checker.py --baseline scan_v1.json --compare scan_v2.json --no-cache
+
+# Diff: HTML report showing what changed between image versions
+python sbom_cve_checker.py --baseline scan_v1.json --compare scan_v2.json \
+    --no-cache --format html --output diff_report.html
 ```
 
 ---
