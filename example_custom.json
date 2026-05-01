@@ -1,0 +1,3 @@
+[
+  {"type": "os",  "name": "openssl",    "version": "1:3.2.2-16.el10",      "path": null, "licenses": ["ASL 2.0"]}
+]

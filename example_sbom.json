@@ -1,0 +1,38 @@
+[
+  {
+    "comment": "--- Language packages (use upstream name + version) ---"
+  },
+  {"name": "log4j-core", "version": "2.14.1",  "ecosystem": "Maven", "purl": "pkg:maven/org.apache.logging.log4j/log4j-core@2.14.1"},
+  {"name": "lodash",     "version": "4.17.20", "ecosystem": "npm",   "purl": "pkg:npm/lodash@4.17.20"},
+  {"name": "django",     "version": "3.2.0",   "ecosystem": "PyPI",  "purl": "pkg:pypi/django@3.2.0"},
+  {"name": "requests",   "version": "2.25.0",  "ecosystem": "PyPI",  "purl": "pkg:pypi/requests@2.25.0"},
+  {"name": "express",    "version": "4.17.1",  "ecosystem": "npm",   "purl": "pkg:npm/express@4.17.1"},
+
+  {
+    "comment": "--- OS packages: ecosystem = Distro:Release, version = distro-packaged version ---"
+  },
+  {
+    "name": "openssl",
+    "version": "1.1.1n-0+deb11u4",
+    "ecosystem": "Debian:11",
+    "purl": "pkg:deb/debian/openssl@1.1.1n-0+deb11u4?distro=bullseye"
+  },
+  {
+    "name": "vim",
+    "version": "2:8.2.2434-3+deb11u1",
+    "ecosystem": "Debian:11",
+    "purl": "pkg:deb/debian/vim@2:8.2.2434-3+deb11u1?distro=bullseye"
+  },
+  {
+    "name": "openssl",
+    "version": "3.0.2-0ubuntu1.10",
+    "ecosystem": "Ubuntu:22.04",
+    "purl": "pkg:deb/ubuntu/openssl@3.0.2-0ubuntu1.10?distro=jammy"
+  },
+  {
+    "name": "openssl",
+    "version": "1.1.1t-r2",
+    "ecosystem": "Alpine:v3.17",
+    "purl": "pkg:apk/alpine/openssl@1.1.1t-r2?distro=alpine-3.17"
+  }
+]

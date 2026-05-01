@@ -1,0 +1,7 @@
+name,version,ecosystem,purl
+log4j-core,2.14.1,Maven,pkg:maven/org.apache.logging.log4j/log4j-core@2.14.1
+lodash,4.17.20,npm,pkg:npm/lodash@4.17.20
+django,3.2.0,PyPI,pkg:pypi/django@3.2.0
+requests,2.25.0,PyPI,pkg:pypi/requests@2.25.0
+numpy,1.19.0,PyPI,pkg:pypi/numpy@1.19.0
+express,4.17.1,npm,pkg:npm/express@4.17.1
