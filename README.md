@@ -325,6 +325,60 @@ python sbom_cve_checker.py --baseline scan_v1.json --compare scan_v2.json \
 
 ---
 
+---
+
+## CVE Portal (`sbom_portal.py`)
+
+Aggregates multiple JSON scan reports into a single self-contained HTML dashboard:
+
+- **Searchable asset table** — filter by name, version, or ecosystem; sort by CVE count or severity
+- **Per-asset drill-down** — click any asset to view all packages and their vulnerabilities
+- **Version comparison** — assets with multiple scan versions get a "Compare" button; the diff panel shows remediated / introduced / persistent CVEs and package additions, removals, and upgrades
+- **NVD links** — every CVE ID links directly to `https://nvd.nist.gov/vuln/detail/<CVE-ID>`
+
+### Workflow
+
+```bash
+# 1. Scan each image version and save JSON reports with asset metadata
+python sbom_cve_checker.py --sbom sbom_v1.json --asset-name myapp --asset-version 1.0.0 \
+    --format json --output scan_v1.json
+
+python sbom_cve_checker.py --sbom sbom_v2.json --asset-name myapp --asset-version 2.0.0 \
+    --format json --output scan_v2.json
+
+# 2. Build the portal from those reports
+python sbom_portal.py scan_v1.json scan_v2.json --output portal.html
+
+# Or load an entire directory of scan reports
+python sbom_portal.py --reports-dir ./scans/ --output portal.html
+
+# 3. Open portal.html in any browser — no server needed
+```
+
+### Portal flags
+
+| Flag | Description |
+|---|---|
+| `reports` | Positional: one or more JSON scan report files |
+| `--reports-dir DIR` | Load all `*.json` files from this directory |
+| `--asset-name NAME` | Override the asset name for all positional reports (when reports lack embedded `asset_name`) |
+| `--asset-versions V1,V2,...` | Assign version labels to each positional report in order |
+| `--output PATH` | Output HTML file (default: `portal.html`) |
+
+### Embedding asset metadata in scan reports
+
+Pass `--asset-name` and `--asset-version` to `sbom_cve_checker.py` to embed metadata directly in the JSON output. The portal reads these fields automatically:
+
+```bash
+python sbom_cve_checker.py --sbom sbom.json \
+    --asset-name "myapp" --asset-version "2.1.0" \
+    --format json --output scan_myapp_2.1.0.json
+```
+
+If `asset_name` / `asset_version` are absent from a report, the portal falls back to the filename (without extension) as the asset name and the `generated_at` date as the version.
+
+---
+
 ## Data sources
 
 | Source | Used for | Rate limit |
