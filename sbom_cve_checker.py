@@ -1408,7 +1408,7 @@ def print_console_diff(diff: dict, baseline_src: str, current_src: str, use_colo
 
 # ─── JSON Report ──────────────────────────────────────────────────────────────
 
-def to_json_report(reports: list) -> str:
+def to_json_report(reports: list, asset_name: str = "", asset_version: str = "") -> str:
     def _cvss_dict(c: CvssV3) -> dict:
         return {
             "base_score": c.base_score, "severity": c.severity,
@@ -1422,6 +1422,8 @@ def to_json_report(reports: list) -> str:
     out = {
         "generated_at": datetime.now().isoformat(),
         "tool": "sbom-cve-checker",
+        "asset_name":    asset_name    or None,
+        "asset_version": asset_version or None,
         "summary": {
             "total_packages": len(reports),
             "vulnerable_packages": sum(1 for r in reports if r.vuln_count > 0),
@@ -1901,6 +1903,12 @@ Examples:
                     help="Explicit OS ecosystem override, e.g. 'debian:11', "
                          "'ubuntu:22.04', 'alpine:v3.17'. Takes precedence over "
                          "--base-image when both are supplied.")
+    ap.add_argument("--asset-name",  metavar="NAME",
+                    help="Logical name of the scanned asset (e.g. 'myapp'). "
+                         "Embedded in JSON output for use by sbom_portal.py.")
+    ap.add_argument("--asset-version", metavar="VER",
+                    help="Version of the scanned asset (e.g. '2.1.0'). "
+                         "Embedded in JSON output for use by sbom_portal.py.")
     ap.add_argument("--no-color",    action="store_true",
                     help="Disable ANSI colors in console output")
     ap.add_argument("--verbose",     action="store_true",
@@ -2106,7 +2114,9 @@ Examples:
         print_console_report(reports, use_color=use_color)
     else:
         if args.format == "json":
-            content = to_json_report(reports)
+            content = to_json_report(reports,
+                                     asset_name=args.asset_name or "",
+                                     asset_version=args.asset_version or "")
         elif args.format == "csv":
             content = to_csv_report(reports)
         else:
