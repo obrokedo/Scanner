@@ -1308,20 +1308,29 @@ _RH_UNFIXED_STATES = {"affected", "fix deferred", "will not fix"}
 
 def _rh_package_state(cve_id: str, pkg_name: str, el: str,
                        verbose: bool = False,
-                       db: Optional[CacheDB] = None) -> Optional[dict]:
+                       db: Optional[CacheDB] = None) -> tuple:
     """Fetch the Red Hat detailed CVE endpoint and return the package_state entry
     for pkg_name on RHEL major version el, or None if not found / not affected.
 
     Caches the package_state list under key 'cve_detail:{cve_id}' in rh_pkg.
+
+    Returns (entry_or_None, detail_hit, detail_miss) where exactly one of
+    detail_hit / detail_miss is 1, indicating whether the response was served
+    from the local cache or fetched from the network.
     """
     cache_key = f"cve_detail:{cve_id}"
     ps_list = _CACHE_MISS
+    detail_hit = detail_miss = 0
+
     if db is not None:
         ps_list = db.get_rh(cache_key)
-        if ps_list is not _CACHE_MISS and verbose:
-            print(f"      RH cve_detail cache hit: {cve_id}", file=sys.stderr)
+        if ps_list is not _CACHE_MISS:
+            detail_hit = 1
+            if verbose:
+                print(f"      RH cve_detail cache hit: {cve_id}", file=sys.stderr)
 
     if ps_list is _CACHE_MISS:
+        detail_miss = 1
         url = f"{_RH_CVE_DETAIL_URL}/{quote(cve_id)}.json"
         if verbose:
             print(f"      RH cve_detail fetch: {cve_id}", file=sys.stderr)
@@ -1344,8 +1353,8 @@ def _rh_package_state(cve_id: str, pkg_name: str, el: str,
         # product names like "Red Hat Enterprise Linux 9"
         if (f"enterprise_linux:{el}" in cpe or f":el{el}" in cpe
                 or f" {el}" in pnam or pnam.endswith(f":{el}")):
-            return ps
-    return None
+            return ps, detail_hit, detail_miss
+    return None, detail_hit, detail_miss
 
 
 def _query_redhat(packages: list, verbose: bool = False,
@@ -1361,13 +1370,15 @@ def _query_redhat(packages: list, verbose: bool = False,
     then checks whether the installed version is less than the fixed version
     listed in the advisory.
 
-    Returns (vuln_map, rh_hits, rh_misses) where vuln_map[i] is a list of
-    Vulnerability objects for packages[i] not already covered by OSV.
+    Returns (vuln_map, pkg_hits, pkg_misses, detail_hits, detail_misses).
+    pkg_hits/misses count the package-level summary queries (/cve.json?package=X).
+    detail_hits/misses count the per-CVE detail queries (/cve/CVE-XXXX.json).
     """
     import re
 
     vuln_map: list = [[] for _ in packages]
     rh_hits = rh_misses = 0
+    detail_hits = detail_misses = 0
 
     for i, pkg in enumerate(packages):
         if not re.search(r'\.(el|fc)\d', pkg.version.lower()):
@@ -1421,9 +1432,11 @@ def _query_redhat(packages: list, verbose: bool = False,
                 # Check the detailed CVE endpoint: if the package is explicitly
                 # listed in package_state as still-affected, report it anyway
                 # (with no fixed_version) so the user knows it is unpatched.
-                ps_entry = _rh_package_state(
+                ps_entry, dh, dm = _rh_package_state(
                     cve_id, pkg.name, el, verbose, db
                 )
+                detail_hits   += dh
+                detail_misses += dm
                 if ps_entry is None:
                     continue
                 fix_state = ps_entry.get("fix_state", "").lower()
@@ -1497,7 +1510,7 @@ def _query_redhat(packages: list, verbose: bool = False,
                 references=refs,
             ))
 
-    return vuln_map, rh_hits, rh_misses
+    return vuln_map, rh_hits, rh_misses, detail_hits, detail_misses
 
 
 # ─── Console Report ───────────────────────────────────────────────────────────
@@ -2378,9 +2391,8 @@ Examples:
 
         # ── Red Hat Security API (supplemental for .el/.fc packages) ──
         if not getattr(args, "no_redhat", False):
-            rh_vuln_map, rh_hits, rh_misses = _query_redhat(
-                packages, verbose=args.verbose, db=db
-            )
+            rh_vuln_map, rh_pkg_hits, rh_pkg_misses, rh_det_hits, rh_det_misses = \
+                _query_redhat(packages, verbose=args.verbose, db=db)
             rh_added = 0
             for report, rh_vulns in zip(current_reports, rh_vuln_map):
                 osv_ids = {v.id for v in report.vulnerabilities}
@@ -2389,9 +2401,15 @@ Examples:
                     if rv.id not in osv_ids and not (set(rv.cve_ids) & osv_cve_ids):
                         report.vulnerabilities.append(rv)
                         rh_added += 1
-            if rh_misses > 0 or rh_added > 0:
-                print(f"[*] Red Hat Security API: {rh_added} additional CVE(s) found "
-                      f"(cache: {rh_hits} hit(s), {rh_misses} fetch(es))", file=sys.stderr)
+            rh_total_net = rh_pkg_misses + rh_det_misses
+            rh_total_cached = rh_pkg_hits + rh_det_hits
+            print(
+                f"[*] Red Hat Security API: {rh_added} additional CVE(s) found "
+                f"({rh_total_net} network request(s), {rh_total_cached} cached)\n"
+                f"    pkg summaries : {rh_pkg_misses} fetched, {rh_pkg_hits} cached\n"
+                f"    CVE details   : {rh_det_misses} fetched, {rh_det_hits} cached",
+                file=sys.stderr
+            )
 
         current_src = str(args.sbom)
 
