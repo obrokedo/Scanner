@@ -24,6 +24,7 @@ NVD API key (free): https://nvd.nist.gov/developers/request-an-api-key
 """
 
 import argparse
+import bz2
 import csv
 import io
 import json
@@ -33,6 +34,7 @@ import sys
 import time
 import urllib.request
 import urllib.error
+import xml.etree.ElementTree as ET
 from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
@@ -47,11 +49,12 @@ _DEFAULT_CACHE_DB = Path.home() / ".cache" / "sbom_cve_checker" / "cache.db"
 
 
 class CacheDB:
-    """SQLite-backed result cache for OSV and NVD API responses.
+    """SQLite-backed result cache for OSV, NVD, and Red Hat API responses.
 
-    Two tables:
+    Tables:
       osv_pkg  — full vulnerability list per package (ecosystem:name:version)
       nvd_cvss — CVSS dict per CVE ID (NULL row = NVD confirmed no data)
+      rh_pkg   — Red Hat REST API responses keyed by 'sum:{el}:{name}' or 'det:{cve_id}'
 
     Entries older than `ttl` seconds are considered stale and re-fetched.
     """
@@ -77,14 +80,30 @@ class CacheDB:
                 cvss_json  TEXT,
                 fetched_at REAL NOT NULL
             );
+            CREATE TABLE IF NOT EXISTS oval_vuln (
+                el_major    TEXT NOT NULL,
+                pkg_name    TEXT NOT NULL,
+                cve_id      TEXT NOT NULL,
+                fixed_evr   TEXT,
+                severity    TEXT NOT NULL DEFAULT '',
+                cvss_vector TEXT NOT NULL DEFAULT '',
+                cvss_score  REAL NOT NULL DEFAULT 0.0,
+                summary     TEXT NOT NULL DEFAULT '',
+                PRIMARY KEY (el_major, pkg_name, cve_id)
+            );
+            CREATE TABLE IF NOT EXISTS oval_meta (
+                el_major   TEXT PRIMARY KEY,
+                fetched_at REAL NOT NULL
+            );
             CREATE TABLE IF NOT EXISTS rh_pkg (
                 pkg_key    TEXT PRIMARY KEY,
                 cves_json  TEXT NOT NULL,
                 fetched_at REAL NOT NULL
             );
-            CREATE INDEX IF NOT EXISTS idx_osv_pkg_age  ON osv_pkg  (fetched_at);
-            CREATE INDEX IF NOT EXISTS idx_nvd_cvss_age ON nvd_cvss (fetched_at);
-            CREATE INDEX IF NOT EXISTS idx_rh_pkg_age   ON rh_pkg   (fetched_at);
+            CREATE INDEX IF NOT EXISTS idx_rh_pkg_age    ON rh_pkg    (fetched_at);
+            CREATE INDEX IF NOT EXISTS idx_osv_pkg_age   ON osv_pkg   (fetched_at);
+            CREATE INDEX IF NOT EXISTS idx_nvd_cvss_age  ON nvd_cvss  (fetched_at);
+            CREATE INDEX IF NOT EXISTS idx_oval_vuln_pkg ON oval_vuln (el_major, pkg_name);
         """)
         self._con.commit()
 
@@ -136,10 +155,43 @@ class CacheDB:
         )
         self._con.commit()
 
-    # ── Red Hat package CVE cache ─────────────────────────────────────────────
+    # ── OVAL vulnerability index ──────────────────────────────────────────────
+
+    def oval_is_fresh(self, el_major: str) -> bool:
+        """True if OVAL data for this RHEL major version was downloaded within _OVAL_TTL."""
+        row = self._con.execute(
+            "SELECT fetched_at FROM oval_meta WHERE el_major = ?", (el_major,)
+        ).fetchone()
+        return bool(row and (time.time() - row[0]) < _OVAL_TTL)
+
+    def oval_store(self, el_major: str, rows: list):
+        """Bulk-replace all OVAL records for el_major with a freshly-parsed list."""
+        self._con.execute("DELETE FROM oval_vuln WHERE el_major = ?", (el_major,))
+        self._con.executemany(
+            "INSERT OR REPLACE INTO oval_vuln "
+            "(el_major, pkg_name, cve_id, fixed_evr, severity, cvss_vector, cvss_score, summary) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+            [(el_major, pkg, cve, evr, sev, vec, scr, summ)
+             for pkg, cve, evr, sev, vec, scr, summ in rows],
+        )
+        self._con.execute(
+            "INSERT OR REPLACE INTO oval_meta (el_major, fetched_at) VALUES (?, ?)",
+            (el_major, time.time()),
+        )
+        self._con.commit()
+
+    def oval_query(self, el_major: str, pkg_name: str) -> list:
+        """Return all OVAL vulnerability rows for a package."""
+        return self._con.execute(
+            "SELECT cve_id, fixed_evr, severity, cvss_vector, cvss_score, summary "
+            "FROM oval_vuln WHERE el_major = ? AND pkg_name = ?",
+            (el_major, pkg_name.lower()),
+        ).fetchall()
+
+    # ── Red Hat REST API cache ────────────────────────────────────────────────
 
     def get_rh(self, key: str):
-        """Return cached Red Hat CVE list or _CACHE_MISS. Key: '{el_major}:{pkg_name}'."""
+        """Return cached value or _CACHE_MISS. Key namespacing: 'sum:{el}:{name}' or 'det:{cve_id}'."""
         row = self._con.execute(
             "SELECT cves_json, fetched_at FROM rh_pkg WHERE pkg_key = ?", (key,)
         ).fetchone()
@@ -147,17 +199,18 @@ class CacheDB:
             return json.loads(row[0])
         return _CACHE_MISS
 
-    def put_rh(self, key: str, cves: list):
+    def put_rh(self, key: str, data):
         self._con.execute(
             "INSERT OR REPLACE INTO rh_pkg (pkg_key, cves_json, fetched_at) VALUES (?, ?, ?)",
-            (key, json.dumps(cves), time.time()),
+            (key, json.dumps(data), time.time()),
         )
         self._con.commit()
 
     # ── Maintenance ───────────────────────────────────────────────────────────
 
     def prune(self) -> tuple:
-        """Delete entries older than TTL. Returns (osv_removed, nvd_removed, rh_removed)."""
+        """Delete OSV/NVD/RH entries older than TTL. Returns (osv_removed, nvd_removed, rh_removed).
+        OVAL data uses its own _OVAL_TTL and is refreshed wholesale, not pruned."""
         cutoff = time.time() - self.ttl
         c1 = self._con.execute(
             "DELETE FROM osv_pkg  WHERE fetched_at < ?", (cutoff,)
@@ -165,14 +218,15 @@ class CacheDB:
         c2 = self._con.execute(
             "DELETE FROM nvd_cvss WHERE fetched_at < ?", (cutoff,)
         ).rowcount
-        c3 = self._con.execute(
-            "DELETE FROM rh_pkg   WHERE fetched_at < ?", (cutoff,)
-        ).rowcount
+        c3 = self._con.execute("DELETE FROM rh_pkg WHERE fetched_at < ?", (cutoff,)).rowcount
         self._con.commit()
         return c1, c2, c3
 
     def clear(self):
-        self._con.executescript("DELETE FROM osv_pkg; DELETE FROM nvd_cvss; DELETE FROM rh_pkg;")
+        self._con.executescript(
+            "DELETE FROM osv_pkg; DELETE FROM nvd_cvss; "
+            "DELETE FROM oval_vuln; DELETE FROM oval_meta; DELETE FROM rh_pkg;"
+        )
         self._con.commit()
 
     def info(self) -> dict:
@@ -182,21 +236,29 @@ class CacheDB:
             secs = int(time.time() - ts)
             return f"{secs // 60}m {secs % 60}s ago"
 
-        osv_n  = self._con.execute("SELECT COUNT(*) FROM osv_pkg").fetchone()[0]
-        nvd_n  = self._con.execute("SELECT COUNT(*) FROM nvd_cvss").fetchone()[0]
-        rh_n   = self._con.execute("SELECT COUNT(*) FROM rh_pkg").fetchone()[0]
-        osv_ol = self._con.execute("SELECT MIN(fetched_at) FROM osv_pkg").fetchone()[0]
-        nvd_ol = self._con.execute("SELECT MIN(fetched_at) FROM nvd_cvss").fetchone()[0]
-        rh_ol  = self._con.execute("SELECT MIN(fetched_at) FROM rh_pkg").fetchone()[0]
+        osv_n   = self._con.execute("SELECT COUNT(*) FROM osv_pkg").fetchone()[0]
+        nvd_n   = self._con.execute("SELECT COUNT(*) FROM nvd_cvss").fetchone()[0]
+        oval_n  = self._con.execute("SELECT COUNT(*) FROM oval_vuln").fetchone()[0]
+        rh_n    = self._con.execute("SELECT COUNT(*) FROM rh_pkg").fetchone()[0]
+        osv_ol  = self._con.execute("SELECT MIN(fetched_at) FROM osv_pkg").fetchone()[0]
+        nvd_ol  = self._con.execute("SELECT MIN(fetched_at) FROM nvd_cvss").fetchone()[0]
+        rh_ol   = self._con.execute("SELECT MIN(fetched_at) FROM rh_pkg").fetchone()[0]
+        oval_rows = self._con.execute(
+            "SELECT el_major, fetched_at FROM oval_meta ORDER BY el_major"
+        ).fetchall()
+        oval_ages = {r[0]: _age(r[1]) for r in oval_rows}
         return {
-            "db_path":     str(self.path),
-            "ttl_seconds": self.ttl,
-            "osv_entries": osv_n,
-            "nvd_entries": nvd_n,
-            "rh_entries":  rh_n,
-            "oldest_osv":  _age(osv_ol),
-            "oldest_nvd":  _age(nvd_ol),
-            "oldest_rh":   _age(rh_ol),
+            "db_path":      str(self.path),
+            "ttl_seconds":  self.ttl,
+            "oval_ttl":     _OVAL_TTL,
+            "osv_entries":  osv_n,
+            "nvd_entries":  nvd_n,
+            "oval_entries": oval_n,
+            "rh_entries":   rh_n,
+            "oldest_osv":   _age(osv_ol),
+            "oldest_nvd":   _age(nvd_ol),
+            "oldest_rh":    _age(rh_ol),
+            "oval_indexes": oval_ages,
         }
 
     def close(self):
@@ -581,26 +643,6 @@ def _rpm_lt(v1: str, v2: str) -> bool:
         return vc < 0
     return _rpmvercmp_str(rel1, rel2) < 0
 
-
-def _rh_fixed_evr(fixed_pkg_str: str, expected_name: str) -> Optional[str]:
-    """Parse a Red Hat affected_packages entry and return the EVR if name matches.
-
-    Example: 'binutils-0:2.41-58.el9_4'  ->  '0:2.41-58.el9_4'
-             'gdb-14.2-10.el9_4'          ->  '14.2-10.el9_4'
-    Returns None if the package name does not match expected_name.
-    """
-    import re
-    # With epoch:  {name}-{epoch}:{ver}-{rel}
-    m = re.match(r'^(.+?)-(\d+:.+)$', fixed_pkg_str)
-    if m:
-        if m.group(1).lower() == expected_name.lower():
-            return m.group(2)
-        return None
-    # No epoch:  {name}-{ver}-{rel}  (last two dash-separated fields are ver and rel)
-    parts = fixed_pkg_str.rsplit('-', 2)
-    if len(parts) == 3 and parts[0].lower() == expected_name.lower():
-        return f"{parts[1]}-{parts[2]}"
-    return None
 
 
 def _maven_groupid_from_path(path: str, artifact: str) -> str:
@@ -1292,183 +1334,277 @@ def enrich_with_nvd(reports: list, api_key: Optional[str], verbose: bool = False
     return nvd_hits, nvd_fetches
 
 
-# ─── Red Hat Security API ─────────────────────────────────────────────────────
+# ─── OVAL (Red Hat) ───────────────────────────────────────────────────────────
 
+_OVAL_URL = "https://www.redhat.com/security/data/oval/v2/RHEL{el}/rhel-{el}.oval.xml.bz2"
+_OVAL_TTL = 86400   # 24 h — OVAL files are regenerated daily by Red Hat
 _RH_CVE_URL        = "https://access.redhat.com/hydra/rest/securitydata/cve.json"
 _RH_CVE_DETAIL_URL = "https://access.redhat.com/hydra/rest/securitydata/cve"
-_RH_SEV_MAP = {
+_RH_UNFIXED_STATES = {"affected", "fix deferred", "will not fix"}
+_OVAL_SEV_MAP = {
     "critical":  "Critical",
     "important": "High",
     "moderate":  "Medium",
     "low":       "Low",
 }
-# fix_state values that mean the package is still affected (no released fix)
-_RH_UNFIXED_STATES = {"affected", "fix deferred", "will not fix"}
 
 
-def _rh_package_state(cve_id: str, pkg_name: str, el: str,
-                       verbose: bool = False,
-                       db: Optional[CacheDB] = None) -> tuple:
-    """Fetch the Red Hat detailed CVE endpoint and return the package_state entry
-    for pkg_name on RHEL major version el, or None if not found / not affected.
+def _http_get_bytes(url: str) -> bytes:
+    """HTTP GET that returns raw bytes (used for binary OVAL bz2 downloads)."""
+    hdrs = {"User-Agent": "sbom-cve-checker/1.0"}
+    req = urllib.request.Request(url, headers=hdrs)
+    with urllib.request.urlopen(req, timeout=120) as resp:
+        return resp.read()
 
-    Caches the package_state list under key 'cve_detail:{cve_id}' in rh_pkg.
 
-    Returns (entry_or_None, detail_hit, detail_miss) where exactly one of
-    detail_hit / detail_miss is 1, indicating whether the response was served
-    from the local cache or fetched from the network.
+def _parse_oval_xml(xml_bytes: bytes) -> list:
+    """Parse a Red Hat OVAL XML document into a flat list of vulnerability records.
+
+    Handles class="patch" (RHSA advisory) and class="vulnerability" definitions.
+    Patch advisories may reference multiple CVEs; each gets its own record with the
+    per-CVE CVSS score from the <advisory><cve cvss3="score/vector"> attribute.
+
+    Returns a list of 7-tuples:
+      (pkg_name, cve_id, fixed_evr, severity, cvss_vector, cvss_score, summary)
+
+    fixed_evr is None when no patch has been released (package installed = vulnerable).
+    pkg_name is lower-cased for case-insensitive lookup.
     """
-    cache_key = f"cve_detail:{cve_id}"
-    ps_list = _CACHE_MISS
-    detail_hit = detail_miss = 0
+    def lname(tag: str) -> str:
+        return tag.split('}', 1)[1] if '}' in tag else tag
 
-    if db is not None:
-        ps_list = db.get_rh(cache_key)
-        if ps_list is not _CACHE_MISS:
-            detail_hit = 1
-            if verbose:
-                print(f"      RH cve_detail cache hit: {cve_id}", file=sys.stderr)
+    root = ET.fromstring(xml_bytes)
 
-    if ps_list is _CACHE_MISS:
-        detail_miss = 1
-        url = f"{_RH_CVE_DETAIL_URL}/{quote(cve_id)}.json"
-        if verbose:
-            print(f"      RH cve_detail fetch: {cve_id}", file=sys.stderr)
-        try:
-            obj = _http_get(url)
-            ps_list = obj.get("package_state", []) if isinstance(obj, dict) else []
-        except Exception as exc:
-            print(f"  [WARNING] Red Hat API (detail {cve_id}): {exc}", file=sys.stderr)
-            ps_list = []
-        if db is not None:
-            db.put_rh(cache_key, ps_list)
-        time.sleep(0.2)
+    # ── objects: {obj_id -> pkg_name} ────────────────────────────────────────
+    objects: dict = {}
+    for el in root.iter():
+        if lname(el.tag) == "rpminfo_object":
+            obj_id = el.get("id", "")
+            for child in el:
+                if lname(child.tag) == "name" and child.text:
+                    objects[obj_id] = child.text.strip()
+                    break
 
-    for ps in ps_list:
-        if ps.get("package_name", "").lower() != pkg_name.lower():
+    # ── states: {state_id -> fixed_evr | None | "SIG"} ───────────────────────
+    # None  = any installed version is vulnerable (no fix released)
+    # "SIG" = signature/arch-only check with no version bound — skip these
+    # States often combine <arch> with <evr operation="less than">; the arch
+    # element is just an architecture filter, not a reason to discard the state.
+    states: dict = {}
+    for el in root.iter():
+        if lname(el.tag) == "rpminfo_state":
+            state_id = el.get("id", "")
+            fixed_evr = None
+            sig_only = False
+            for child in el:
+                cn = lname(child.tag)
+                if cn == "evr" and child.get("operation") == "less than":
+                    fixed_evr = (child.text or "").strip() or None
+                elif cn == "signature_keyid":
+                    sig_only = True
+            # Only skip if this is purely a signature check with no version bound
+            states[state_id] = "SIG" if (sig_only and fixed_evr is None) else fixed_evr
+
+    # ── tests: {test_id -> (pkg_name, fixed_evr | None)} ─────────────────────
+    tests: dict = {}
+    for el in root.iter():
+        if lname(el.tag) == "rpminfo_test":
+            test_id = el.get("id", "")
+            obj_ref = state_ref = None
+            for child in el:
+                cn = lname(child.tag)
+                if cn == "object":
+                    obj_ref = child.get("object_ref", "")
+                elif cn == "state":
+                    state_ref = child.get("state_ref", "")
+            pkg_name = objects.get(obj_ref, "") if obj_ref else ""
+            if not pkg_name:
+                continue
+            if state_ref:
+                sv = states.get(state_ref)
+                if sv == "SIG":
+                    continue   # signature/arch test; not a version check
+                tests[test_id] = (pkg_name, sv)
+            else:
+                tests[test_id] = (pkg_name, None)
+
+    # ── definitions ───────────────────────────────────────────────────────────
+    results: list = []
+    for defn in root.iter():
+        if lname(defn.tag) != "definition":
             continue
-        cpe  = ps.get("cpe", "").lower()
-        pnam = ps.get("product_name", "").lower()
-        # Match CPE strings like cpe:/o:redhat:enterprise_linux:9 or
-        # product names like "Red Hat Enterprise Linux 9"
-        if (f"enterprise_linux:{el}" in cpe or f":el{el}" in cpe
-                or f" {el}" in pnam or pnam.endswith(f":{el}")):
-            return ps, detail_hit, detail_miss
-    return None, detail_hit, detail_miss
+        if defn.get("class") not in ("patch", "vulnerability"):
+            continue
+
+        cve_ids: list = []          # may be multiple per patch advisory
+        cve_cvss: dict = {}         # {cve_id: (score, vector)}
+        severity = cvss_vector = summary = ""
+        cvss_score = 0.0
+
+        for meta in defn:
+            if lname(meta.tag) != "metadata":
+                continue
+            for child in meta:
+                cn = lname(child.tag)
+                if cn == "reference" and child.get("source") == "CVE":
+                    cid = child.get("ref_id", "")
+                    if cid:
+                        cve_ids.append(cid)
+                elif cn == "title" and not summary:
+                    summary = (child.text or "").strip()
+                elif cn == "advisory":
+                    for ac in child:
+                        acn = lname(ac.tag)
+                        if acn == "severity" and not severity:
+                            severity = (ac.text or "").strip()
+                        elif acn == "cve":
+                            # <cve cvss3="score/CVSS:3.1/..." ...>CVE-XXXX</cve>
+                            cid_text = (ac.text or "").strip()
+                            attr = ac.get("cvss3", "")
+                            if attr and cid_text:
+                                parts = attr.split("/", 1)
+                                try:
+                                    s = float(parts[0])
+                                except ValueError:
+                                    s = 0.0
+                                v = parts[1] if len(parts) > 1 else ""
+                                cve_cvss[cid_text] = (s, v)
+                        elif acn == "cvss3":
+                            # older format: child elements (fallback)
+                            for c in ac:
+                                if lname(c.tag) == "cvss3_base_score":
+                                    try:
+                                        cvss_score = float(c.text or 0)
+                                    except ValueError:
+                                        pass
+                                elif lname(c.tag) == "cvss3_scoring_vector":
+                                    cvss_vector = (c.text or "").strip()
+            break  # only one <metadata>
+
+        if not cve_ids:
+            continue
+
+        # Walk criteria/criterion to collect (pkg_name, fixed_evr) pairs.
+        # Prefer the "less than" evr version bound over a plain "installed" test.
+        pkg_fixed: dict = {}
+        for crit in defn.iter():
+            if lname(crit.tag) != "criterion":
+                continue
+            entry = tests.get(crit.get("test_ref", ""))
+            if not entry:
+                continue
+            pname, fevr = entry
+            if pname not in pkg_fixed or fevr is not None:
+                pkg_fixed[pname] = fevr
+
+        if not pkg_fixed:
+            continue
+
+        for cve_id in cve_ids:
+            sc, vec = cve_cvss.get(cve_id, (cvss_score, cvss_vector))
+            for pname, fevr in pkg_fixed.items():
+                results.append((pname.lower(), cve_id, fevr,
+                                severity, vec, sc, summary))
+
+    return results
 
 
-def _query_redhat(packages: list, verbose: bool = False,
-                  db: Optional[CacheDB] = None) -> tuple:
-    """Supplemental Red Hat Security API lookup for packages with .el/.fc versions.
+def _ensure_oval(el_major: str, db: CacheDB, verbose: bool = False) -> bool:
+    """Download, decompress, parse, and index the OVAL file for el_major if stale.
 
-    OSV's CVE records sometimes lack package-level affected entries (only GIT
-    ranges), making them invisible to OSV batch queries.  Red Hat's own security
-    data API provides authoritative per-package CVE lists directly.
+    Returns True when OVAL data is available (fresh or just refreshed).
+    """
+    if db.oval_is_fresh(el_major):
+        return True
 
-    For each package whose version contains an .elN or .fcN suffix, this
-    function queries the Red Hat API for all CVEs affecting that package name,
-    then checks whether the installed version is less than the fixed version
-    listed in the advisory.
+    url = _OVAL_URL.format(el=el_major)
+    print(f"[*] Downloading OVAL data for RHEL {el_major} (one-time per {_OVAL_TTL//3600}h)...",
+          file=sys.stderr)
+    if verbose:
+        print(f"      URL: {url}", file=sys.stderr)
+    try:
+        compressed = _http_get_bytes(url)
+        xml_bytes  = bz2.decompress(compressed)
+    except Exception as exc:
+        print(f"  [WARNING] OVAL download failed for RHEL {el_major}: {exc}", file=sys.stderr)
+        return False
 
-    Returns (vuln_map, pkg_hits, pkg_misses, detail_hits, detail_misses).
-    pkg_hits/misses count the package-level summary queries (/cve.json?package=X).
-    detail_hits/misses count the per-CVE detail queries (/cve/CVE-XXXX.json).
+    if verbose:
+        print(f"      Parsing {len(xml_bytes) // 1024} KB of OVAL XML...", file=sys.stderr)
+    rows = _parse_oval_xml(xml_bytes)
+    db.oval_store(el_major, rows)
+    print(f"[*] OVAL index built: {len(rows)} (package, CVE) records for RHEL {el_major}",
+          file=sys.stderr)
+    return True
+
+
+def _query_oval(packages: list, verbose: bool = False,
+                db: Optional[CacheDB] = None) -> tuple:
+    """OVAL-based Red Hat vulnerability lookup for packages with .el/.fc versions.
+
+    Downloads the RHEL OVAL file once per major version (24 h TTL), stores it in
+    the local SQLite cache, then resolves all package lookups locally — zero
+    per-CVE API calls during scanning.
+
+    Returns (vuln_map, downloads, queries, oval_cve_sets):
+      vuln_map[i]      list of Vulnerability objects for packages[i]
+      downloads        number of OVAL files fetched from the network this run
+      queries          number of packages resolved against the local OVAL index
+      oval_cve_sets[i] set of CVE IDs already found for packages[i]
     """
     import re
 
     vuln_map: list = [[] for _ in packages]
-    rh_hits = rh_misses = 0
-    detail_hits = detail_misses = 0
+    oval_cve_sets: list = [set() for _ in packages]
+    downloads = queries = 0
+
+    if db is None:
+        return vuln_map, downloads, queries
+
+    # Ensure the OVAL index is available for every RHEL major version we need
+    needed_els = {
+        _el_major(pkg.version)
+        for pkg in packages
+        if re.search(r'\.(el|fc)\d', pkg.version.lower())
+    } - {""}
+
+    available_els: set = set()
+    for el in sorted(needed_els):
+        was_fresh = db.oval_is_fresh(el)
+        if _ensure_oval(el, db, verbose):
+            available_els.add(el)
+            if not was_fresh:
+                downloads += 1
 
     for i, pkg in enumerate(packages):
         if not re.search(r'\.(el|fc)\d', pkg.version.lower()):
             continue
-
         el = _el_major(pkg.version)
-        if not el:
+        if not el or el not in available_els:
             continue
 
-        cache_key = f"{el}:{pkg.name.lower()}"
+        rows = db.oval_query(el, pkg.name.lower())
+        queries += 1
 
-        cves = _CACHE_MISS
-        if db is not None:
-            cves = db.get_rh(cache_key)
-            if cves is not _CACHE_MISS:
-                rh_hits += 1
-                if verbose:
-                    print(f"      RH cache hit: {cache_key}", file=sys.stderr)
-
-        if cves is _CACHE_MISS:
-            url = f"{_RH_CVE_URL}?package={quote(pkg.name)}&per_page=1000"
-            if verbose:
-                print(f"      RH fetch: {pkg.name} (el{el})", file=sys.stderr)
-            try:
-                cves = _http_get(url)
-                if not isinstance(cves, list):
-                    cves = []
-            except Exception as exc:
-                print(f"  [WARNING] Red Hat API: {pkg.name}: {exc}", file=sys.stderr)
-                cves = []
-            rh_misses += 1
-            if db is not None:
-                db.put_rh(cache_key, cves)
-            time.sleep(0.2)   # gentle rate limiting
-
-        for entry in cves:
-            cve_id = entry.get("CVE", "")
-            if not cve_id.startswith("CVE-"):
-                continue
-
-            # Find the fixed version for this package on this exact .elN stream
-            fixed_evr = None
-            for fp in entry.get("affected_packages", []):
-                evr = _rh_fixed_evr(fp, pkg.name)
-                if evr and f".el{el}" in evr.lower():
-                    fixed_evr = evr
-                    break
-
-            if fixed_evr is None:
-                # No patch released for this el stream yet.
-                # Check the detailed CVE endpoint: if the package is explicitly
-                # listed in package_state as still-affected, report it anyway
-                # (with no fixed_version) so the user knows it is unpatched.
-                ps_entry, dh, dm = _rh_package_state(
-                    cve_id, pkg.name, el, verbose, db
-                )
-                detail_hits   += dh
-                detail_misses += dm
-                if ps_entry is None:
-                    continue
-                fix_state = ps_entry.get("fix_state", "").lower()
-                if fix_state not in _RH_UNFIXED_STATES:
-                    continue
-                affected_ranges_val = [
-                    f"Affected (fix_state: {ps_entry.get('fix_state','unknown')})"
-                ]
-            else:
+        for cve_id, fixed_evr, severity, cvss_vector, cvss_score, summary in rows:
+            if fixed_evr is not None:
                 try:
                     if not _rpm_lt(pkg.version, fixed_evr):
-                        continue   # installed version >= fixed version; already patched
+                        continue   # already at or above fixed version
                 except Exception:
                     continue
                 affected_ranges_val = [f"< {fixed_evr}"]
-
-            # Build CVSS object from Red Hat's data
-            vector = (entry.get("cvss3_scoring_vector") or
-                      entry.get("cvss_scoring_vector") or "")
-            try:
-                score = float(entry.get("cvss3_score") or entry.get("cvss_score") or 0)
-            except (ValueError, TypeError):
-                score = 0.0
+            else:
+                affected_ranges_val = ["Affected (no fix available)"]
 
             cvss = None
-            if vector or score:
-                parsed_m = _parse_cvss_v3_vector(vector) if vector else {}
-                computed  = _compute_cvss_v3_score(vector) if vector else score
+            if cvss_vector or cvss_score:
+                parsed_m = _parse_cvss_v3_vector(cvss_vector) if cvss_vector else {}
+                computed  = _compute_cvss_v3_score(cvss_vector) if cvss_vector else cvss_score
                 cvss = CvssV3(
-                    vector_string=vector,
-                    base_score=score or computed,
-                    severity=_score_to_severity(score or computed),
+                    vector_string=cvss_vector,
+                    base_score=cvss_score or computed,
+                    severity=_score_to_severity(cvss_score or computed),
                     attack_vector=parsed_m.get("AV", ""),
                     attack_complexity=parsed_m.get("AC", ""),
                     privileges_required=parsed_m.get("PR", ""),
@@ -1479,38 +1615,265 @@ def _query_redhat(packages: list, verbose: bool = False,
                     availability_impact=parsed_m.get("A", ""),
                 )
 
-            sev_rh  = (entry.get("severity") or "").lower()
-            sev_lbl = _RH_SEV_MAP.get(sev_rh, "")
+            sev_lbl = _OVAL_SEV_MAP.get(severity.lower(), "")
             if not sev_lbl:
-                sev_lbl = _score_to_severity(score or 0) if score else "Unknown"
-
-            pub  = (entry.get("public_date") or "")[:10]
-            refs = [
-                {"type": "ADVISORY",
-                 "url": f"https://access.redhat.com/security/cve/{cve_id}"},
-                {"type": "WEB",
-                 "url": f"https://nvd.nist.gov/vuln/detail/{cve_id}"},
-            ]
-            for adv in entry.get("advisories", []):
-                refs.append({"type": "ADVISORY",
-                             "url": f"https://access.redhat.com/errata/{adv}"})
+                sev_lbl = _score_to_severity(cvss_score) if cvss_score else "Unknown"
 
             vuln_map[i].append(Vulnerability(
                 id=cve_id,
                 aliases=[cve_id],
                 cve_ids=[cve_id],
-                summary=entry.get("bugzilla_description", ""),
+                summary=summary,
                 details="",
                 cvss_v3=cvss,
                 severity_label=sev_lbl,
                 affected_ranges=affected_ranges_val,
                 fixed_version=fixed_evr,
-                published=pub,
-                modified=pub,
-                references=refs,
+                published="",
+                modified="",
+                references=[
+                    {"type": "ADVISORY",
+                     "url": f"https://access.redhat.com/security/cve/{cve_id}"},
+                    {"type": "WEB",
+                     "url": f"https://nvd.nist.gov/vuln/detail/{cve_id}"},
+                ],
             ))
+            oval_cve_sets[i].add(cve_id)
 
-    return vuln_map, rh_hits, rh_misses, detail_hits, detail_misses
+    return vuln_map, downloads, queries, oval_cve_sets
+
+
+def _query_rh_unfixed(packages: list, oval_cve_ids_per_pkg: list,
+                      verbose: bool = False,
+                      db: Optional[CacheDB] = None,
+                      max_net_requests: int = 0) -> tuple:
+    """Supplemental Red Hat REST API lookup for unfixed CVEs (no OVAL entry exists).
+
+    For each .el/.fc package:
+      1. Fetches the Red Hat Security API summary (1 request, cached per package).
+      2. Skips CVEs already covered by OVAL or having a fix for this el stream.
+      3. For remaining CVEs, calls the per-CVE detail endpoint and checks
+         package_state for an unfixed fix_state.
+
+    Before making any detail network requests, prints an upfront count of how
+    many cached vs network requests are needed so the user can press Ctrl+C.
+    KeyboardInterrupt is caught per-package and returns partial results gracefully.
+
+    max_net_requests: stop making NEW network requests after this many (0 = no limit).
+
+    Returns (vuln_map, sum_fetches, sum_hits, det_fetches, det_hits).
+    """
+    import re
+
+    vuln_map: list = [[] for _ in packages]
+    sum_fetches = sum_hits = det_fetches = det_hits = 0
+    total_net = 0          # running total of network requests made this call
+    interrupted = False
+
+    for i, pkg in enumerate(packages):
+        if interrupted:
+            break
+        if not re.search(r'\.(el|fc)\d', pkg.version.lower()):
+            continue
+        el = _el_major(pkg.version)
+        if not el:
+            continue
+
+        already_known: set = oval_cve_ids_per_pkg[i] if oval_cve_ids_per_pkg else set()
+
+        # ── 1. Package summary ────────────────────────────────────────────────
+        sum_key = f"sum:{el}:{pkg.name.lower()}"
+        cves = _CACHE_MISS
+        if db is not None:
+            cves = db.get_rh(sum_key)
+        if cves is not _CACHE_MISS:
+            sum_hits += 1
+            if verbose:
+                print(f"      RH summary cache hit: {sum_key}", file=sys.stderr)
+        else:
+            if max_net_requests and total_net >= max_net_requests:
+                print(f"  [*] Red Hat unfixed: request limit ({max_net_requests}) reached,"
+                      f" skipping {pkg.name}", file=sys.stderr)
+                continue
+            url = f"{_RH_CVE_URL}?package={quote(pkg.name)}&per_page=1000"
+            if verbose:
+                print(f"      RH summary fetch: {pkg.name} (el{el})", file=sys.stderr)
+            try:
+                cves = _http_get(url)
+                if not isinstance(cves, list):
+                    cves = []
+            except Exception as exc:
+                print(f"  [WARNING] Red Hat API: {pkg.name}: {exc}", file=sys.stderr)
+                cves = []
+            sum_fetches += 1
+            total_net   += 1
+            if db is not None:
+                db.put_rh(sum_key, cves)
+            time.sleep(0.2)
+
+        # ── 2. Filter: skip OVAL-known and fixed CVEs ─────────────────────────
+        candidates = []
+        for entry in cves:
+            cve_id = entry.get("CVE", "")
+            if not cve_id.startswith("CVE-"):
+                continue
+            if cve_id in already_known:
+                continue
+            has_fix_for_el = any(
+                f".el{el}" in (fp or "").lower()
+                for fp in entry.get("affected_packages", [])
+            )
+            if has_fix_for_el:
+                continue
+            candidates.append((cve_id, entry))
+
+        if not candidates:
+            continue
+
+        # ── 3. Pre-scan cache to show upfront request count ───────────────────
+        need_net = []
+        need_cached = []
+        for cve_id, entry in candidates:
+            det_key = f"det:{cve_id}"
+            cached = db is not None and db.get_rh(det_key) is not _CACHE_MISS
+            (need_cached if cached else need_net).append((cve_id, entry, det_key))
+
+        limit_note = (f", limit={max_net_requests - total_net} remaining"
+                      if max_net_requests else "")
+        print(
+            f"[*] Red Hat unfixed ({pkg.name} el{el}): "
+            f"{len(candidates)} CVE(s) to check — "
+            f"{len(need_cached)} cached, {len(need_net)} network request(s){limit_note}"
+            + (" — press Ctrl+C to skip" if need_net else ""),
+            file=sys.stderr,
+        )
+
+        # ── 4. Process cached entries first (free) ────────────────────────────
+        all_to_check = need_cached + need_net
+
+        try:
+            for (cve_id, entry, det_key) in all_to_check:
+                ps_list = _CACHE_MISS
+                if db is not None:
+                    ps_list = db.get_rh(det_key)
+
+                if ps_list is not _CACHE_MISS:
+                    det_hits += 1
+                    if verbose:
+                        print(f"      RH detail cache hit: {cve_id}", file=sys.stderr)
+                else:
+                    if max_net_requests and total_net >= max_net_requests:
+                        print(f"  [*] Red Hat unfixed: request limit ({max_net_requests})"
+                              f" reached at {cve_id}, stopping detail lookups for"
+                              f" {pkg.name}", file=sys.stderr)
+                        break
+
+                    url = f"{_RH_CVE_DETAIL_URL}/{quote(cve_id)}.json"
+                    if verbose:
+                        print(f"      RH detail fetch: {cve_id}"
+                              f" ({total_net + 1} net requests so far)", file=sys.stderr)
+                    try:
+                        obj = _http_get(url)
+                        ps_list = obj.get("package_state", []) if isinstance(obj, dict) else []
+                    except Exception as exc:
+                        print(f"  [WARNING] Red Hat API detail {cve_id}: {exc}",
+                              file=sys.stderr)
+                        ps_list = []
+                    det_fetches += 1
+                    total_net   += 1
+                    if db is not None:
+                        db.put_rh(det_key, ps_list)
+                    time.sleep(0.2)
+
+                    # Print a running counter every 10 network requests
+                    if total_net % 10 == 0:
+                        print(f"    Red Hat detail requests: {total_net} network"
+                              f" ({det_hits} cached) so far...", file=sys.stderr)
+
+                # Match package name + el version in package_state
+                matched_state = None
+                for ps in ps_list:
+                    if ps.get("package_name", "").lower() != pkg.name.lower():
+                        continue
+                    cpe  = ps.get("cpe", "").lower()
+                    pnam = ps.get("product_name", "").lower()
+                    if (f"enterprise_linux:{el}" in cpe or f":el{el}" in cpe
+                            or f" {el}" in pnam or pnam.endswith(f":{el}")):
+                        matched_state = ps
+                        break
+
+                if matched_state is None:
+                    continue
+                fix_state = matched_state.get("fix_state", "").lower()
+                if fix_state not in _RH_UNFIXED_STATES:
+                    continue
+
+                vector = (entry.get("cvss3_scoring_vector")
+                          or entry.get("cvss_scoring_vector") or "")
+                try:
+                    score = float(entry.get("cvss3_score") or entry.get("cvss_score") or 0)
+                except (ValueError, TypeError):
+                    score = 0.0
+
+                cvss = None
+                if vector or score:
+                    parsed_m = _parse_cvss_v3_vector(vector) if vector else {}
+                    computed  = _compute_cvss_v3_score(vector) if vector else score
+                    cvss = CvssV3(
+                        vector_string=vector,
+                        base_score=score or computed,
+                        severity=_score_to_severity(score or computed),
+                        attack_vector=parsed_m.get("AV", ""),
+                        attack_complexity=parsed_m.get("AC", ""),
+                        privileges_required=parsed_m.get("PR", ""),
+                        user_interaction=parsed_m.get("UI", ""),
+                        scope=parsed_m.get("S", ""),
+                        confidentiality_impact=parsed_m.get("C", ""),
+                        integrity_impact=parsed_m.get("I", ""),
+                        availability_impact=parsed_m.get("A", ""),
+                    )
+
+                sev_rh  = (entry.get("severity") or "").lower()
+                sev_lbl = _OVAL_SEV_MAP.get(sev_rh, "")
+                if not sev_lbl:
+                    sev_lbl = _score_to_severity(score) if score else "Unknown"
+
+                vuln_map[i].append(Vulnerability(
+                    id=cve_id,
+                    aliases=[cve_id],
+                    cve_ids=[cve_id],
+                    summary=entry.get("bugzilla_description", ""),
+                    details="",
+                    cvss_v3=cvss,
+                    severity_label=sev_lbl,
+                    affected_ranges=[
+                        f"Affected (fix_state: {matched_state.get('fix_state','unknown')})"
+                    ],
+                    fixed_version=None,
+                    published=(entry.get("public_date") or "")[:10],
+                    modified=(entry.get("public_date") or "")[:10],
+                    references=[
+                        {"type": "ADVISORY",
+                         "url": f"https://access.redhat.com/security/cve/{cve_id}"},
+                        {"type": "WEB",
+                         "url": f"https://nvd.nist.gov/vuln/detail/{cve_id}"},
+                    ],
+                ))
+
+        except KeyboardInterrupt:
+            found_so_far = len(vuln_map[i])
+            print(
+                f"\n  [!] Interrupted — {pkg.name}: {found_so_far} unfixed CVE(s) found so far."
+                f" Continuing with remaining packages...",
+                file=sys.stderr,
+            )
+            interrupted = True
+
+    if interrupted:
+        print("[*] Red Hat unfixed check was interrupted — results are partial.",
+              file=sys.stderr)
+
+    return vuln_map, sum_fetches, sum_hits, det_fetches, det_hits
 
 
 # ─── Console Report ───────────────────────────────────────────────────────────
@@ -2225,7 +2588,9 @@ Examples:
     ap.add_argument("--no-nvd",      action="store_true",
                     help="Skip NVD enrichment (uses OSV CVSS data + computed scores only)")
     ap.add_argument("--no-redhat",   action="store_true",
-                    help="Skip the Red Hat Security API supplemental lookup for .el/.fc packages")
+                    help="Skip the OVAL/Red Hat vulnerability lookup for .el/.fc packages")
+    ap.add_argument("--oval-only", action="store_true",
+                    help="Red Hat: use OVAL only (skip unfixed CVE REST API check). Faster but misses CVEs with no released patch.")
     ap.add_argument("--min-severity",
                     choices=["critical", "high", "medium", "low"],
                     help="Only report at or above this severity")
@@ -2389,27 +2754,46 @@ Examples:
                     print(f"    NVD cache: {nvd_hits} hit(s), {nvd_fetches} API call(s)",
                           file=sys.stderr)
 
-        # ── Red Hat Security API (supplemental for .el/.fc packages) ──
+        # ── OVAL / Red Hat vulnerability index ────────────────────────────────
         if not getattr(args, "no_redhat", False):
-            rh_vuln_map, rh_pkg_hits, rh_pkg_misses, rh_det_hits, rh_det_misses = \
-                _query_redhat(packages, verbose=args.verbose, db=db)
-            rh_added = 0
-            for report, rh_vulns in zip(current_reports, rh_vuln_map):
-                osv_ids = {v.id for v in report.vulnerabilities}
+            oval_vuln_map, oval_downloads, oval_queries, oval_cve_sets = \
+                _query_oval(packages, verbose=args.verbose, db=db)
+            oval_added = 0
+            for report, oval_vulns in zip(current_reports, oval_vuln_map):
+                osv_ids     = {v.id for v in report.vulnerabilities}
                 osv_cve_ids = {cid for v in report.vulnerabilities for cid in v.cve_ids}
-                for rv in rh_vulns:
-                    if rv.id not in osv_ids and not (set(rv.cve_ids) & osv_cve_ids):
-                        report.vulnerabilities.append(rv)
-                        rh_added += 1
-            rh_total_net = rh_pkg_misses + rh_det_misses
-            rh_total_cached = rh_pkg_hits + rh_det_hits
-            print(
-                f"[*] Red Hat Security API: {rh_added} additional CVE(s) found "
-                f"({rh_total_net} network request(s), {rh_total_cached} cached)\n"
-                f"    pkg summaries : {rh_pkg_misses} fetched, {rh_pkg_hits} cached\n"
-                f"    CVE details   : {rh_det_misses} fetched, {rh_det_hits} cached",
-                file=sys.stderr
-            )
+                for ov in oval_vulns:
+                    if ov.id not in osv_ids and not (set(ov.cve_ids) & osv_cve_ids):
+                        report.vulnerabilities.append(ov)
+                        oval_added += 1
+            if oval_queries > 0 or oval_added > 0:
+                dl_note = f", {oval_downloads} OVAL file(s) downloaded" if oval_downloads else ""
+                print(f"[*] OVAL (Red Hat): {oval_added} additional CVE(s) found"
+                      f" ({oval_queries} package(s) queried{dl_note})",
+                      file=sys.stderr)
+
+            # ── Unfixed CVE check (REST API, skips what OVAL already found) ──
+            if not getattr(args, "oval_only", False):
+                rh_vuln_map, sf, sh, df, dh = _query_rh_unfixed(
+                    packages, oval_cve_sets, verbose=args.verbose, db=db
+                )
+                rh_added = 0
+                for report, rh_vulns in zip(current_reports, rh_vuln_map):
+                    osv_ids     = {v.id for v in report.vulnerabilities}
+                    osv_cve_ids = {cid for v in report.vulnerabilities for cid in v.cve_ids}
+                    for rv in rh_vulns:
+                        if rv.id not in osv_ids and not (set(rv.cve_ids) & osv_cve_ids):
+                            report.vulnerabilities.append(rv)
+                            rh_added += 1
+                net = sf + df
+                cached = sh + dh
+                if net > 0 or rh_added > 0:
+                    print(
+                        f"[*] Red Hat unfixed CVEs: {rh_added} additional CVE(s) found"
+                        f" ({net} network request(s), {cached} cached —"
+                        f" {sf} pkg summaries, {df} CVE details)",
+                        file=sys.stderr
+                    )
 
         current_src = str(args.sbom)
 
