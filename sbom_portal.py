@@ -489,10 +489,9 @@ function onVerChange(nameKey, assetId){{
     const c=(val,cls)=>val?`<span class="${{cls}}">${{val}}</span>`:'<span style="color:#aaa">0</span>';
     const t=document.getElementById('rs-total-'+fid);
     if(t)t.innerHTML=s.total_vulnerabilities||'<span style="color:#28a745">0</span>';
-    [['crit','count c-crit'],['high','count c-high'],['med','count c-med'],['low','count c-low']].forEach(([k,cls])=>{{
-      const key=k==='med'?'medium':k;
+    [['crit','critical','count c-crit'],['high','high','count c-high'],['med','medium','count c-med'],['low','low','count c-low']].forEach(([k,field,cls])=>{{
       const el=document.getElementById('rs-'+k+'-'+fid);
-      if(el)el.innerHTML=c(s[key]||0,cls);
+      if(el)el.innerHTML=c(s[field]||0,cls);
     }});
   }}
   showDetail(nameKey,id);
