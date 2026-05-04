@@ -50,8 +50,12 @@ def _compute_diff(base_pkgs: list, cur_pkgs: list) -> dict:
             (vuln.get("primary_id") or vuln.get("id") or "").lower(),
         )
 
+    def _eco_family(eco: str) -> str:
+        """Strip distro release version for cross-version package matching (e.g. Debian:11 -> debian)."""
+        return (eco or "").lower().split(":")[0]
+
     def _pkey(pkg: dict) -> tuple:
-        return ((pkg.get("ecosystem") or "").lower(), (pkg.get("name") or "").lower())
+        return (_eco_family(pkg.get("ecosystem") or ""), (pkg.get("name") or "").lower())
 
     base_vulns: dict = {}
     for p in base_pkgs:
@@ -90,10 +94,18 @@ def _compute_diff(base_pkgs: list, cur_pkgs: list) -> dict:
         "pkgs_removed": [{"name": p.get("name"), "version": p.get("version"),
                           "ecosystem": p.get("ecosystem")} for k, p in base_pmap.items() if k not in cur_pmap],
         "pkgs_upgraded": [
-            {"name": base_pmap[k].get("name"), "ecosystem": base_pmap[k].get("ecosystem"),
-             "from_ver": base_pmap[k].get("version"), "to_ver": cur_pmap[k].get("version")}
+            {
+                "name":     base_pmap[k].get("name"),
+                "from_eco": base_pmap[k].get("ecosystem"),
+                "to_eco":   cur_pmap[k].get("ecosystem"),
+                "from_ver": base_pmap[k].get("version"),
+                "to_ver":   cur_pmap[k].get("version"),
+            }
             for k in base_pmap
-            if k in cur_pmap and base_pmap[k].get("version") != cur_pmap[k].get("version")
+            if k in cur_pmap and (
+                base_pmap[k].get("version") != cur_pmap[k].get("version") or
+                base_pmap[k].get("ecosystem") != cur_pmap[k].get("ecosystem")
+            )
         ],
     }
 
@@ -292,16 +304,20 @@ code{{background:#f1f3f5;padding:1px 4px;border-radius:3px;font-size:.82em}}
     </div>
     <div id="detail-summary" class="stat-row"></div>
     <div id="detail-meta" style="font-size:.82em;color:#6c757d;margin-bottom:10px"></div>
+    <div class="toolbar" style="margin-bottom:8px">
+      <input id="detail-search" type="text" placeholder="Search package, CVE ID, summary..." oninput="onDetailSearch(this.value)">
+      <span id="detail-count" style="font-size:.82em;color:#6c757d;white-space:nowrap"></span>
+    </div>
     <table class="pkg-table" id="detail-table">
       <thead style="background:#343a40;color:#fff">
         <tr>
-          <th style="padding:8px">Package</th>
-          <th style="padding:8px">CVE / ID</th>
-          <th style="padding:8px;text-align:center">Severity</th>
-          <th style="padding:8px;text-align:center">CVSS</th>
+          <th class="sortable" style="padding:8px" onclick="sortDetail('pkg')" id="dh-pkg">Package</th>
+          <th class="sortable" style="padding:8px" onclick="sortDetail('cve')" id="dh-cve">CVE / ID</th>
+          <th class="sortable" style="padding:8px;text-align:center" onclick="sortDetail('sev')" id="dh-sev">Severity</th>
+          <th class="sortable" style="padding:8px;text-align:center" onclick="sortDetail('cvss')" id="dh-cvss">CVSS &#x25BE;</th>
           <th style="padding:8px">Summary</th>
           <th style="padding:8px">Fix</th>
-          <th style="padding:8px">Published</th>
+          <th class="sortable" style="padding:8px" onclick="sortDetail('pub')" id="dh-pub">Published</th>
         </tr>
       </thead>
       <tbody id="detail-body"></tbody>
@@ -316,6 +332,10 @@ code{{background:#f1f3f5;padding:1px 4px;border-radius:3px;font-size:.82em}}
     </div>
     <div id="diff-stat-row" class="stat-row"></div>
     <div class="diff-tabs" id="diff-tabs"></div>
+    <div id="diff-search-bar" style="display:none;margin-bottom:8px" class="toolbar">
+      <input id="diff-search" type="text" placeholder="Search package, CVE ID, summary..." oninput="onDiffSearch(this.value)">
+      <span id="diff-count" style="font-size:.82em;color:#6c757d;white-space:nowrap"></span>
+    </div>
     <div id="diff-content"></div>
   </div>
 </div>
@@ -359,14 +379,11 @@ D.assets.forEach(a=>{{
 // ─── Asset table ─────────────────────────────────────────────────────────────
 
 let sortCol='name', sortAsc=true, sevFilter='', searchQ='';
+const selectedVer={{}};  // nameKey -> assetId of the currently selected version
 
-function maxSeverityRank(asset){{
-  const r={{critical:4,high:3,medium:2,low:1}};
-  let best=0;
-  (asset.packages||[]).forEach(p=>(p.vulnerabilities||[]).forEach(v=>{{
-    best=Math.max(best,r[sev(v.severity)]||0);
-  }}));
-  return best;
+function selAsset(nameKey, versions){{
+  const sid=selectedVer[nameKey];
+  return(sid!=null&&D.assets.find(a=>a.id===sid))||versions[versions.length-1];
 }}
 
 function renderTable(){{
@@ -381,14 +398,10 @@ function renderTable(){{
   }});
 
   grouped.forEach((versions,nameKey)=>{{
-    // Collect across all versions for aggregate stats
-    const latest=versions[versions.length-1];
-    const allVersions=versions.map(v=>v.version);
-    const totalCrit=versions.reduce((s,v)=>s+v.summary.critical,0);
-    const totalHigh=versions.reduce((s,v)=>s+v.summary.high,0);
-    const totalMed =versions.reduce((s,v)=>s+v.summary.medium,0);
-    const totalLow =versions.reduce((s,v)=>s+v.summary.low,0);
-    const totalVulns=versions.reduce((s,v)=>s+v.summary.total_vulnerabilities,0);
+    const cur=selAsset(nameKey,versions);
+    const s=cur.summary;
+    const totalCrit=s.critical, totalHigh=s.high, totalMed=s.medium, totalLow=s.low;
+    const totalVulns=s.total_vulnerabilities;
 
     // Search filter
     if(q){{
@@ -409,7 +422,7 @@ function renderTable(){{
       if(sevFilter==='low'&&totalLow===0)return;
     }}
 
-    rows.push({{nameKey,versions,latest,allVersions,totalCrit,totalHigh,totalMed,totalLow,totalVulns}});
+    rows.push({{nameKey,versions,cur,totalCrit,totalHigh,totalMed,totalLow,totalVulns}});
   }});
 
   // Sort
@@ -432,32 +445,32 @@ function renderTable(){{
   noR.style.display='none';
 
   tbody.innerHTML=rows.map(row=>{{
-    const{{nameKey,versions,latest,allVersions,totalCrit,totalHigh,totalMed,totalLow,totalVulns}}=row;
+    const{{nameKey,versions,cur,totalCrit,totalHigh,totalMed,totalLow,totalVulns}}=row;
     const hasDiff=versions.length>1;
+    const firstId=versions[0].id;
 
-    // Version selector (if multiple)
+    // Version selector (if multiple); selected = cur
     const verSel=versions.length>1
-      ?`<select class="ver-sel" id="vsel-${{nameKey}}" onchange="onVerChange('${{nameKey}}',this.value)">
-          ${{versions.map(v=>`<option value="${{v.id}}">${{h(v.version)}}</option>`).join('')}}
+      ?`<select class="ver-sel" onchange="onVerChange('${{nameKey}}',this.value)">
+          ${{versions.map(v=>`<option value="${{v.id}}"${{v.id===cur.id?' selected':''}}>${{h(v.version)}}</option>`).join('')}}
         </select>`
-      :`<span class="ver-pill">${{h(latest.version)}}</span>`;
+      :`<span class="ver-pill">${{h(cur.version)}}</span>`;
 
-    const critHtml=totalCrit?`<td class="count c-crit">${{totalCrit}}</td>`:`<td style="color:#aaa">0</td>`;
-    const highHtml=totalHigh?`<td class="count c-high">${{totalHigh}}</td>`:`<td style="color:#aaa">0</td>`;
-    const medHtml =totalMed ?`<td class="count c-med">${{totalMed}}</td>` :`<td style="color:#aaa">0</td>`;
-    const lowHtml =totalLow ?`<td class="count c-low">${{totalLow}}</td>` :`<td style="color:#aaa">0</td>`;
-
-    const scanned=(latest.generated||'').slice(0,10)||'&mdash;';
-    const viewBtn=`<button class="btn btn-view btn-sm" onclick="showDetail('${{nameKey}}', ${{latest.id}})">View</button>`;
+    const c=(val,cls)=>val?`<span class="${{cls}}">${{val}}</span>`:'<span style="color:#aaa">0</span>';
+    const scanned=(cur.generated||'').slice(0,10)||'&mdash;';
+    const viewBtn=`<button class="btn btn-view btn-sm" onclick="showDetail('${{nameKey}}',${{cur.id}})">View</button>`;
     const diffBtn=hasDiff
       ?`<button class="btn btn-diff btn-sm" style="margin-left:4px" onclick="showDiff('${{nameKey}}')">Compare</button>`
       :'';
 
-    return`<tr data-name="${{nameKey}}" data-crit="${{totalCrit}}" data-high="${{totalHigh}}">
-      <td><b>${{h(latest.name)}}</b></td>
+    return`<tr data-name="${{nameKey}}">
+      <td><b>${{h(cur.name)}}</b></td>
       <td>${{verSel}}</td>
-      <td class="count">${{totalVulns||'<span style="color:#28a745">0</span>'}}</td>
-      ${{critHtml}}${{highHtml}}${{medHtml}}${{lowHtml}}
+      <td id="rs-total-${{firstId}}">${{totalVulns||'<span style="color:#28a745">0</span>'}}</td>
+      <td id="rs-crit-${{firstId}}">${{c(totalCrit,'count c-crit')}}</td>
+      <td id="rs-high-${{firstId}}">${{c(totalHigh,'count c-high')}}</td>
+      <td id="rs-med-${{firstId}}">${{c(totalMed,'count c-med')}}</td>
+      <td id="rs-low-${{firstId}}">${{c(totalLow,'count c-low')}}</td>
       <td style="font-size:.8em;color:#6c757d">${{scanned}}</td>
       <td>${{viewBtn}}${{diffBtn}}</td>
     </tr>`;
@@ -465,7 +478,24 @@ function renderTable(){{
 }}
 
 function onVerChange(nameKey, assetId){{
-  showDetail(nameKey, parseInt(assetId));
+  const id=parseInt(assetId);
+  selectedVer[nameKey]=id;
+  const asset=D.assets.find(a=>a.id===id);
+  if(!asset)return;
+  const s=asset.summary;
+  const peers=byName[nameKey]||[];
+  if(peers.length){{
+    const fid=peers[0];
+    const c=(val,cls)=>val?`<span class="${{cls}}">${{val}}</span>`:'<span style="color:#aaa">0</span>';
+    const t=document.getElementById('rs-total-'+fid);
+    if(t)t.innerHTML=s.total_vulnerabilities||'<span style="color:#28a745">0</span>';
+    [['crit','count c-crit'],['high','count c-high'],['med','count c-med'],['low','count c-low']].forEach(([k,cls])=>{{
+      const key=k==='med'?'medium':k;
+      const el=document.getElementById('rs-'+k+'-'+fid);
+      if(el)el.innerHTML=c(s[key]||0,cls);
+    }});
+  }}
+  showDetail(nameKey,id);
 }}
 
 // Sort click
@@ -495,6 +525,74 @@ document.querySelectorAll('.filter-btn').forEach(btn=>{{
 // ─── Detail panel ────────────────────────────────────────────────────────────
 
 let currentDetailName=null;
+let detailRows=[];
+let detailSearch='';
+let detailSortCol='cvss', detailSortAsc=false;
+
+const _sevRank={{critical:4,high:3,medium:2,low:1}};
+
+function applyDetailSort(){{
+  const headers={{pkg:'dh-pkg',cve:'dh-cve',sev:'dh-sev',cvss:'dh-cvss',pub:'dh-pub'}};
+  Object.entries(headers).forEach(([col,id])=>{{
+    const el=document.getElementById(id);
+    if(!el)return;
+    const base=el.textContent.replace(/ [▴▾]$/,'');
+    el.textContent=col===detailSortCol?base+(detailSortAsc?' ▴':' ▾'):base;
+  }});
+}}
+
+function filterDetailRows(){{
+  const q=detailSearch.toLowerCase();
+  let rows=detailRows;
+  if(q)rows=rows.filter(({{pkg,v}})=>
+    (pkg.name||'').toLowerCase().includes(q)||
+    (v.primary_id||v.id||'').toLowerCase().includes(q)||
+    (v.summary||'').toLowerCase().includes(q)||
+    (pkg.ecosystem||'').toLowerCase().includes(q)
+  );
+  return [...rows].sort((a,b)=>{{
+    let va,vb;
+    if(detailSortCol==='cvss'){{va=a.v.cvss_score||0;vb=b.v.cvss_score||0;}}
+    else if(detailSortCol==='sev'){{va=_sevRank[sev(a.v.severity)]||0;vb=_sevRank[sev(b.v.severity)]||0;}}
+    else if(detailSortCol==='pkg'){{va=(a.pkg.name||'').toLowerCase();vb=(b.pkg.name||'').toLowerCase();}}
+    else if(detailSortCol==='cve'){{va=(a.v.primary_id||'').toLowerCase();vb=(b.v.primary_id||'').toLowerCase();}}
+    else if(detailSortCol==='pub'){{va=a.v.published||'';vb=b.v.published||'';}}
+    else{{va=0;vb=0;}}
+    if(va<vb)return detailSortAsc?-1:1;
+    if(va>vb)return detailSortAsc?1:-1;
+    return 0;
+  }});
+}}
+
+function renderDetailBody(){{
+  const rows=filterDetailRows();
+  const total=detailRows.length, shown=rows.length;
+  document.getElementById('detail-count').textContent=
+    detailSearch?`${{shown}} of ${{total}} shown`:`${{total}} finding${{total===1?'':'s'}}`;
+  document.getElementById('detail-body').innerHTML=rows.length
+    ?rows.map(({{pkg,v}})=>`<tr>
+        <td>${{h(pkg.name)}}<br><small style="color:#666">${{h(pkg.version)}} &middot; ${{h(pkg.ecosystem)}}</small></td>
+        <td>${{cveCell(v)}}</td>
+        <td style="text-align:center">${{badge(v.severity)}}</td>
+        <td style="text-align:center">${{scoreCell(v)}}</td>
+        <td>${{h(v.summary)}}</td>
+        <td>${{fixCell(v.fixed_version)}}</td>
+        <td style="font-size:.8em;color:#6c757d">${{v.published||'&mdash;'}}</td>
+      </tr>`).join('')
+    :`<tr><td colspan="7" class="empty-msg">${{detailSearch?'No results match "'+h(detailSearch)+'"':'No vulnerabilities detected in this scan.'}}</td></tr>`;
+}}
+
+function sortDetail(col){{
+  if(detailSortCol===col)detailSortAsc=!detailSortAsc;
+  else{{detailSortCol=col;detailSortAsc=col==='pkg'||col==='cve'||col==='pub';}}
+  applyDetailSort();
+  renderDetailBody();
+}}
+
+function onDetailSearch(val){{
+  detailSearch=val;
+  renderDetailBody();
+}}
 
 function showDetail(nameKey, assetId){{
   const asset=D.assets.find(a=>a.id===assetId);
@@ -510,7 +608,7 @@ function showDetail(nameKey, assetId){{
     verSel.style.display='';
     verSel.innerHTML=peers.map(id=>{{
       const a=D.assets.find(x=>x.id===id);
-      return`<option value="${{id}}" ${{id===assetId?'selected':''}}>${{h(a.version)}}</option>`;
+      return`<option value="${{id}}"${{id===assetId?' selected':''}}>${{h(a.version)}}</option>`;
     }}).join('');
     verSel.onchange=()=>showDetail(nameKey,parseInt(verSel.value));
   }}else{{verSel.style.display='none';}}
@@ -532,29 +630,16 @@ function showDetail(nameKey, assetId){{
   if(asset.generated)meta.push(`Scanned: ${{asset.generated.slice(0,19).replace('T',' ')}}`);
   document.getElementById('detail-meta').innerHTML=meta.join(' &nbsp;|&nbsp; ');
 
-  // Vulnerability rows — sorted by CVSS score desc
-  const vulnRows=[];
+  // Rebuild row data (reset search/sort state on new asset)
+  detailRows=[];
   (asset.packages||[]).forEach(pkg=>{{
-    (pkg.vulnerabilities||[]).forEach(v=>{{
-      vulnRows.push({{pkg,v}});
-    }});
+    (pkg.vulnerabilities||[]).forEach(v=>detailRows.push({{pkg,v}}));
   }});
-  vulnRows.sort((a,b)=>(b.v.cvss_score||0)-(a.v.cvss_score||0));
-
-  document.getElementById('detail-body').innerHTML=vulnRows.length
-    ?vulnRows.map(r=>{{
-        const{{pkg,v}}=r;
-        return`<tr>
-          <td>${{h(pkg.name)}}<br><small style="color:#666">${{h(pkg.version)}} &middot; ${{h(pkg.ecosystem)}}</small></td>
-          <td>${{cveCell(v)}}</td>
-          <td style="text-align:center">${{badge(v.severity)}}</td>
-          <td style="text-align:center">${{scoreCell(v)}}</td>
-          <td>${{h(v.summary)}}</td>
-          <td>${{fixCell(v.fixed_version)}}</td>
-          <td style="font-size:.8em;color:#6c757d">${{v.published||'&mdash;'}}</td>
-        </tr>`;
-      }}).join('')
-    :`<tr><td colspan="7" class="empty-msg">No vulnerabilities detected in this scan.</td></tr>`;
+  detailSearch='';
+  document.getElementById('detail-search').value='';
+  detailSortCol='cvss'; detailSortAsc=false;
+  applyDetailSort();
+  renderDetailBody();
 
   document.getElementById('detail-panel').classList.add('open');
   document.getElementById('detail-panel').scrollIntoView({{behavior:'smooth',block:'nearest'}});
@@ -568,6 +653,72 @@ function closeDetail(){{
 // ─── Diff panel ──────────────────────────────────────────────────────────────
 
 let currentDiffKey=null, currentDiffTab='introduced';
+let diffRows=[];
+let diffSearch='';
+let diffSortCol='cvss', diffSortAsc=false;
+
+function filterDiffRows(){{
+  const q=diffSearch.toLowerCase();
+  let rows=diffRows;
+  if(q)rows=rows.filter(v=>
+    (v.pkg_name||'').toLowerCase().includes(q)||
+    (v.primary_id||v.id||'').toLowerCase().includes(q)||
+    (v.summary||'').toLowerCase().includes(q)||
+    (v.ecosystem||'').toLowerCase().includes(q)
+  );
+  return [...rows].sort((a,b)=>{{
+    let va,vb;
+    if(diffSortCol==='cvss'){{va=a.cvss_score||0;vb=b.cvss_score||0;}}
+    else if(diffSortCol==='sev'){{va=_sevRank[sev(a.severity)]||0;vb=_sevRank[sev(b.severity)]||0;}}
+    else if(diffSortCol==='pkg'){{va=(a.pkg_name||'').toLowerCase();vb=(b.pkg_name||'').toLowerCase();}}
+    else if(diffSortCol==='cve'){{va=(a.primary_id||'').toLowerCase();vb=(b.primary_id||'').toLowerCase();}}
+    else{{va=0;vb=0;}}
+    if(va<vb)return diffSortAsc?-1:1;
+    if(va>vb)return diffSortAsc?1:-1;
+    return 0;
+  }});
+}}
+
+function onDiffSearch(val){{
+  diffSearch=val;
+  renderDiffVulnRows();
+}}
+
+function sortDiff(col){{
+  if(diffSortCol===col)diffSortAsc=!diffSortAsc;
+  else{{diffSortCol=col;diffSortAsc=col==='pkg'||col==='cve';}}
+  renderDiffVulnRows();
+}}
+
+function renderDiffVulnRows(){{
+  const rows=filterDiffRows();
+  const total=diffRows.length,shown=rows.length;
+  document.getElementById('diff-count').textContent=
+    diffSearch?`${{shown}} of ${{total}} shown`:`${{total}} finding${{total===1?'':'s'}}`;
+  const el=document.getElementById('diff-content');
+  if(!rows.length){{
+    el.innerHTML=`<p class="empty-msg">${{diffSearch?'No results match "'+h(diffSearch)+'"':'None.'}}</p>`;
+    return;
+  }}
+  const sDir=col=>col===diffSortCol?(diffSortAsc?' ▴':' ▾'):'';
+  el.innerHTML=`<table>
+    <thead><tr>
+      <th style="padding:8px;cursor:pointer" onclick="sortDiff('pkg')">Package${{sDir('pkg')}}</th>
+      <th style="padding:8px;cursor:pointer" onclick="sortDiff('cve')">CVE / ID${{sDir('cve')}}</th>
+      <th style="padding:8px;text-align:center;cursor:pointer" onclick="sortDiff('sev')">Severity${{sDir('sev')}}</th>
+      <th style="padding:8px;text-align:center;cursor:pointer" onclick="sortDiff('cvss')">CVSS${{sDir('cvss')}}</th>
+      <th style="padding:8px">Summary</th>
+      <th style="padding:8px">Fix</th>
+    </tr></thead>
+    <tbody>${{rows.map(v=>`<tr class="${{currentDiffTab==='introduced'?'row-introduced':currentDiffTab==='remediated'?'row-remediated':'row-persistent'}}">
+      <td class="pkg-table">${{h(v.pkg_name)}}<br><small style="color:#666">${{h(v.pkg_version)}} &middot; ${{h(v.ecosystem)}}</small></td>
+      <td>${{cveCell(v)}}</td>
+      <td style="text-align:center">${{badge(v.severity)}}</td>
+      <td style="text-align:center">${{scoreCell(v)}}</td>
+      <td>${{h(v.summary)}}</td>
+      <td>${{fixCell(v.fixed_version)}}</td>
+    </tr>`).join('')}}</tbody></table>`;
+}}
 
 function showDiff(nameKey){{
   const diffGroup=D.diffs[nameKey];
@@ -637,7 +788,7 @@ function invertDiff(diff){{
     persistent:diff.persistent,
     pkgs_added:diff.pkgs_removed,
     pkgs_removed:diff.pkgs_added,
-    pkgs_upgraded:diff.pkgs_upgraded.map(u=>({{...u,from_ver:u.to_ver,to_ver:u.from_ver}})),
+    pkgs_upgraded:diff.pkgs_upgraded.map(u=>({{...u,from_eco:u.to_eco,to_eco:u.from_eco,from_ver:u.to_ver,to_ver:u.from_ver}})),
   }};
 }}
 
@@ -685,47 +836,45 @@ function switchDiffTab(tab){{
   if(diff)renderDiffTab(diff);
 }}
 
-function diffVulnTable(rows,rowCls){{
-  if(!rows.length)return'<p class="empty-msg">None.</p>';
-  return`<table>
-    <thead><tr>
-      <th style="padding:8px">Package</th>
-      <th style="padding:8px">CVE / ID</th>
-      <th style="padding:8px;text-align:center">Severity</th>
-      <th style="padding:8px;text-align:center">CVSS</th>
-      <th style="padding:8px">Summary</th>
-      <th style="padding:8px">Fix</th>
-    </tr></thead>
-    <tbody>${{rows.map(v=>`<tr class="${{rowCls}}">
-      <td class="pkg-table">${{h(v.pkg_name)}}<br><small style="color:#666">${{h(v.pkg_version)}} &middot; ${{h(v.ecosystem)}}</small></td>
-      <td>${{cveCell(v)}}</td>
-      <td style="text-align:center">${{badge(v.severity)}}</td>
-      <td style="text-align:center">${{scoreCell(v)}}</td>
-      <td>${{h(v.summary)}}</td>
-      <td>${{fixCell(v.fixed_version)}}</td>
-    </tr>`).join('')}}</tbody></table>`;
-}}
-
 function renderDiffTab(diff){{
-  const el=document.getElementById('diff-content');
-  if(currentDiffTab==='introduced'){{
-    el.innerHTML=diffVulnTable(diff.introduced,'row-introduced');
-  }}else if(currentDiffTab==='remediated'){{
-    el.innerHTML=diffVulnTable(diff.remediated,'row-remediated');
-  }}else if(currentDiffTab==='persistent'){{
-    el.innerHTML=diffVulnTable(diff.persistent,'row-persistent');
+  const isCvuTab=currentDiffTab!=='pkgchanges';
+  document.getElementById('diff-search-bar').style.display=isCvuTab?'':'none';
+
+  if(currentDiffTab==='introduced'||currentDiffTab==='remediated'||currentDiffTab==='persistent'){{
+    diffRows=diff[currentDiffTab]||[];
+    diffSearch='';
+    const si=document.getElementById('diff-search');
+    if(si)si.value='';
+    diffSortCol='cvss'; diffSortAsc=false;
+    renderDiffVulnRows();
   }}else{{
     // Package changes
-    const added  =diff.pkgs_added  ||[];
-    const removed=diff.pkgs_removed||[];
+    const added   =diff.pkgs_added   ||[];
+    const removed =diff.pkgs_removed ||[];
     const upgraded=diff.pkgs_upgraded||[];
+    const el=document.getElementById('diff-content');
     if(!added.length&&!removed.length&&!upgraded.length){{
       el.innerHTML='<p class="empty-msg">No package additions, removals, or version changes detected.</p>';return;
     }}
-    let html='<table><thead><tr><th style="padding:8px">Change</th><th style="padding:8px">Package</th><th style="padding:8px">Version</th><th style="padding:8px">Ecosystem</th></tr></thead><tbody>';
-    added.forEach(p=>html+=`<tr><td>${{badgeChange('added')}}</td><td>${{h(p.name)}}</td><td>${{h(p.version)}}</td><td>${{h(p.ecosystem)}}</td></tr>`);
-    removed.forEach(p=>html+=`<tr><td>${{badgeChange('removed')}}</td><td>${{h(p.name)}}</td><td>${{h(p.version)}}</td><td>${{h(p.ecosystem)}}</td></tr>`);
-    upgraded.forEach(u=>html+=`<tr><td>${{badgeChange('upgraded')}}</td><td>${{h(u.name)}}</td><td><del>${{h(u.from_ver)}}</del> &rarr; <b>${{h(u.to_ver)}}</b></td><td>${{h(u.ecosystem)}}</td></tr>`);
+    let html='<table><thead><tr>'
+      +'<th style="padding:8px">Change</th><th style="padding:8px">Package</th>'
+      +'<th style="padding:8px">Version</th><th style="padding:8px">Ecosystem</th>'
+      +'</tr></thead><tbody>';
+    added.forEach(p=>{{
+      html+=`<tr><td>${{badgeChange('added')}}</td><td>${{h(p.name)}}</td><td>${{h(p.version)}}</td><td>${{h(p.ecosystem)}}</td></tr>`;
+    }});
+    removed.forEach(p=>{{
+      html+=`<tr><td>${{badgeChange('removed')}}</td><td>${{h(p.name)}}</td><td>${{h(p.version)}}</td><td>${{h(p.ecosystem)}}</td></tr>`;
+    }});
+    upgraded.forEach(u=>{{
+      const ecoCell=u.from_eco&&u.to_eco&&u.from_eco!==u.to_eco
+        ?`<del>${{h(u.from_eco)}}</del> &rarr; <b>${{h(u.to_eco)}}</b>`
+        :h(u.from_eco||u.to_eco||'');
+      const verCell=u.from_ver!==u.to_ver
+        ?`<del>${{h(u.from_ver)}}</del> &rarr; <b>${{h(u.to_ver)}}</b>`
+        :h(u.to_ver||'');
+      html+=`<tr><td>${{badgeChange('upgraded')}}</td><td>${{h(u.name)}}</td><td>${{verCell}}</td><td>${{ecoCell}}</td></tr>`;
+    }});
     html+='</tbody></table>';
     el.innerHTML=html;
   }}
