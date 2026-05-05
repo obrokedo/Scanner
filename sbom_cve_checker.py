@@ -181,11 +181,19 @@ class CacheDB:
         self._con.commit()
 
     def oval_query(self, el_major: str, pkg_name: str) -> list:
-        """Return all OVAL vulnerability rows for a package."""
+        """Return OVAL rows for pkg_name or any subpackage prefixed with 'pkg_name-'.
+
+        RPM source packages produce multiple binary packages that conventionally
+        share the source name as a prefix (e.g. krb5 → krb5-libs, krb5-workstation).
+        SBOMs from scanners that report source names rather than binary names benefit
+        from this prefix expansion; the minority of non-prefixed subpackages (e.g.
+        libkadm5 from krb5) are accepted false-positive risk.
+        """
+        n = pkg_name.lower()
         return self._con.execute(
             "SELECT cve_id, fixed_evr, severity, cvss_vector, cvss_score, summary "
-            "FROM oval_vuln WHERE el_major = ? AND pkg_name = ?",
-            (el_major, pkg_name.lower()),
+            "FROM oval_vuln WHERE el_major = ? AND (pkg_name = ? OR pkg_name LIKE ?)",
+            (el_major, n, n + "-%"),
         ).fetchall()
 
     # ── Red Hat REST API cache ────────────────────────────────────────────────
@@ -1790,10 +1798,13 @@ def _query_rh_unfixed(packages: list, oval_cve_ids_per_pkg: list,
                         print(f"    Red Hat detail requests: {total_net} network"
                               f" ({det_hits} cached) so far...", file=sys.stderr)
 
-                # Match package name + el version in package_state
+                # Match package name + el version in package_state.
+                # Accept exact match or source-prefix match (krb5 → krb5-libs).
                 matched_state = None
+                src_name = pkg.name.lower()
                 for ps in ps_list:
-                    if ps.get("package_name", "").lower() != pkg.name.lower():
+                    ps_pkg = ps.get("package_name", "").lower()
+                    if ps_pkg != src_name and not ps_pkg.startswith(src_name + "-"):
                         continue
                     cpe  = ps.get("cpe", "").lower()
                     pnam = ps.get("product_name", "").lower()
